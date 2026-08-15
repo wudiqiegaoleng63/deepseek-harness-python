@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import tempfile
 from pathlib import Path
 
 from ..models import JsonValue
@@ -70,6 +71,15 @@ class JsonlSessionStore:
 
     @staticmethod
     def _write_atomic(path: Path, text: str) -> None:
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(text, encoding="utf-8")
-        os.replace(temporary, path)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+                stream.write(text)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)

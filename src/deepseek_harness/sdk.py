@@ -38,6 +38,14 @@ class DeepSeekHarnessConfig:
     shutdown_timeout_seconds: float = 5.0
     adapter_factory: AdapterFactory | None = field(default=None, repr=False)
 
+    def __post_init__(self) -> None:
+        if self.max_tokens is not None and self.max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+        if self.request_timeout_seconds is not None and self.request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be positive or None")
+        if self.shutdown_timeout_seconds <= 0:
+            raise ValueError("shutdown_timeout_seconds must be positive")
+
 
 @dataclass(frozen=True, slots=True)
 class RunResult:
@@ -200,9 +208,17 @@ class DeepSeekHarness:
     def _call(self, coroutine: Coroutine[Any, Any, T], *, timeout: float | None = None) -> T:
         loop = self._loop
         if loop is None or not loop.is_running():
+            coroutine.close()
             raise RuntimeError("DeepSeek Harness runtime is not running")
         future: Future[T] = asyncio.run_coroutine_threadsafe(coroutine, loop)
-        return future.result(timeout=timeout)
+        try:
+            return future.result(timeout=timeout)
+        except TimeoutError:
+            # Propagate cancellation into the event-loop thread so a timed-out
+            # request cannot keep mutating the session after the caller has
+            # already observed the timeout.
+            future.cancel()
+            raise
 
     def _require_runtime(self) -> HarnessService:
         runtime = self._runtime

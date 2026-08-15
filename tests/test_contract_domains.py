@@ -222,6 +222,14 @@ def test_rpc_validation_and_projection_baseline_match_wire_contract(tmp_path) ->
                     "content": [{"type": "text", "text": 42}],
                 },
             )
+        with pytest.raises(ApiFault, match="title must be a string"):
+            await service.dispatch("session.rename", {"sessionId": "validation", "title": 42})
+        with pytest.raises(ApiFault, match="path must be a string"):
+            await service.dispatch("host.listDirectory", {"path": 42})
+        with pytest.raises(ApiFault, match="baseURL must be a string"):
+            await service.dispatch(
+                "llm.discoverModels", {"settingsNs": "llm-deepseek", "baseURL": 42}
+            )
         await service.dispose()
 
     asyncio.run(scenario())

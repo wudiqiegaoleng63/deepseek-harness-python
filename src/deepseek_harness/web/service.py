@@ -895,7 +895,10 @@ class HarnessService:
                     "subagent sessions cannot be renamed here",
                     {"reason": "subagent"},
                 )
-            title = str(payload.get("title", "")).strip()
+            raw_title = payload.get("title")
+            if not isinstance(raw_title, str):
+                raise ApiFault("bad-request", "title must be a string")
+            title = raw_title.strip()
             if not title:
                 raise ApiFault(
                     "title-invalid",
@@ -925,7 +928,7 @@ class HarnessService:
                 "canOpenPath": False,
             }
         if method == "host.listDirectory":
-            return self._list_directory(self._optional_string(payload.get("path")))
+            return self._list_directory(self._optional_payload_string(payload, "path"))
         if method == "host.createDirectory":
             return self._create_directory(
                 self._required_string(payload, "path"), self._required_string(payload, "name")
@@ -1217,7 +1220,7 @@ class HarnessService:
                 preset = await self.presets.copy(
                     source,
                     target,
-                    self._optional_string(payload.get("name")),
+                    self._optional_payload_string(payload, "name"),
                 )
             except AgentPresetError as exc:
                 raise self._preset_fault(exc) from exc
@@ -1929,7 +1932,7 @@ class HarnessService:
 
     async def _discover_models(self, payload: JsonObject) -> JsonObject:
         settings_ns = self._required_string(payload, "settingsNs")
-        base_url = self._optional_string(payload.get("baseURL"))
+        base_url = self._optional_payload_string(payload, "baseURL")
         if not base_url:
             try:
                 settings = await self.settings.get(settings_ns)
@@ -1943,7 +1946,7 @@ class HarnessService:
                     {"settingsNs": settings_ns},
                 ) from exc
         base_url = (base_url or "https://api.deepseek.com").rstrip("/")
-        api_key = self._optional_string(payload.get("apiKey"))
+        api_key = self._optional_payload_string(payload, "apiKey")
         if not api_key:
             ref = "DEEPSEEK_API_KEY"
             api_key = await self.credentials.resolve(ref)

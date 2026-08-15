@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .policy import WorkspacePolicy
+from .policy import PermissionMode, WorkspacePolicy
 from .registry import ToolDefinition, ToolRegistry, ToolResult
 
 
@@ -110,9 +111,18 @@ async def _list_files(args: dict[str, Any], policy: WorkspacePolicy) -> ToolResu
         return ToolResult("max_entries must be positive", is_error=True)
     entries = await asyncio.to_thread(lambda: sorted(path.iterdir(), key=lambda item: item.name))
     visible = entries[:max_entries]
-    result = "\n".join(
-        f"{item.relative_to(policy.root)}{'/' if item.is_dir() else ''}" for item in visible
-    )
+
+    def display_path(item: Path) -> str:
+        if policy.mode is PermissionMode.DANGER_FULL_ACCESS:
+            try:
+                shown = item.relative_to(policy.root)
+            except ValueError:
+                shown = item
+        else:
+            shown = item.relative_to(policy.root)
+        return f"{shown}{'/' if item.is_dir() else ''}"
+
+    result = "\n".join(display_path(item) for item in visible)
     if len(entries) > max_entries:
         result += f"\n[truncated after {max_entries} entries]"
     return ToolResult(result)
@@ -126,8 +136,11 @@ async def _run_bash(args: dict[str, Any], policy: WorkspacePolicy) -> ToolResult
     timeout = float(args.get("timeout_seconds", 60))
     if timeout <= 0:
         return ToolResult("timeout_seconds must be positive", is_error=True)
+    executable = shutil.which("bash") or shutil.which("sh")
+    if executable is None:
+        return ToolResult("a bash-compatible shell is not installed", is_error=True)
     process = await asyncio.create_subprocess_exec(
-        "/bin/bash",
+        executable,
         "-lc",
         command,
         cwd=str(policy.root),

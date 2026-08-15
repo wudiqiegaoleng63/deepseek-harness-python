@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -41,9 +42,18 @@ class JsonStateStore:
         await asyncio.to_thread(self._save_sync, encoded)
 
     def _save_sync(self, encoded: str) -> None:
-        temporary = self.path.with_name(f".{self.path.name}.tmp")
-        temporary.write_text(encoded, encoding="utf-8")
-        os.replace(temporary, self.path)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def _copy_object(value: dict[str, Any]) -> dict[str, Any]:

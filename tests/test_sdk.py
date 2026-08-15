@@ -2,8 +2,19 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
+import pytest
+
 from deepseek_harness import DeepSeekHarness, DeepSeekHarnessConfig
 from deepseek_harness.llm.types import LlmRequest, StreamChunk
+
+
+def test_native_sdk_config_rejects_invalid_limits() -> None:
+    with pytest.raises(ValueError, match="max_tokens"):
+        DeepSeekHarnessConfig(max_tokens=0)
+    with pytest.raises(ValueError, match="request_timeout_seconds"):
+        DeepSeekHarnessConfig(request_timeout_seconds=0)
+    with pytest.raises(ValueError, match="shutdown_timeout_seconds"):
+        DeepSeekHarnessConfig(shutdown_timeout_seconds=0)
 
 
 class SdkAdapter:

@@ -48,3 +48,29 @@ def test_read_only_policy_rejects_writes(tmp_path) -> None:
                 dispose()
 
     asyncio.run(scenario())
+
+
+def test_danger_full_access_listing_can_render_paths_outside_workspace(tmp_path) -> None:
+    async def scenario() -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        outside = tmp_path / "outside.txt"
+        outside.write_text("outside", encoding="utf-8")
+        registry = ToolRegistry()
+        disposers = install_builtin_tools(
+            registry,
+            WorkspacePolicy(workspace, PermissionMode.DANGER_FULL_ACCESS),
+        )
+        try:
+            result = await registry.execute(
+                "list_files",
+                f'{{"path":"{tmp_path}"}}',
+                ToolContext("session-test", str(workspace)),
+            )
+            assert not result.is_error
+            assert "outside.txt" in result.text
+        finally:
+            for dispose in reversed(disposers):
+                dispose()
+
+    asyncio.run(scenario())
