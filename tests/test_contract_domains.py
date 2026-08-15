@@ -4,11 +4,14 @@ import asyncio
 import base64
 from collections.abc import AsyncIterator
 
+import pytest
+
 from deepseek_harness.attachments import AttachmentStore
 from deepseek_harness.goals import GoalManager
 from deepseek_harness.llm.types import LlmRequest, StreamChunk
 from deepseek_harness.session import Session
 from deepseek_harness.web import HarnessService
+from deepseek_harness.web.service import ApiFault
 
 PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 
@@ -195,6 +198,30 @@ def test_skill_list_discovers_project_frontmatter_and_filters_model_only_skills(
                 "modelInvocable": True,
             }
         ]
+        await service.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_rpc_validation_and_projection_baseline_match_wire_contract(tmp_path) -> None:
+    async def scenario() -> None:
+        service = HarnessService(tmp_path / "state", cwd=tmp_path)
+        await service.dispatch("session.create", {"sessionId": "validation", "cwd": str(tmp_path)})
+        history = await service.dispatch("session.history", {"sessionId": "validation"})
+        assert history["projections"]["asOfSeq"] == -1
+        assert history["projections"]["values"]["imageLimits"]["maxImageBytes"] > 0
+
+        with pytest.raises(ApiFault, match="500 characters"):
+            await service.dispatch("session.search", {"query": "x" * 501})
+        with pytest.raises(ApiFault, match="text content"):
+            await service.dispatch(
+                "session.prompt",
+                {
+                    "sessionId": "validation",
+                    "mode": "queue",
+                    "content": [{"type": "text", "text": 42}],
+                },
+            )
         await service.dispose()
 
     asyncio.run(scenario())

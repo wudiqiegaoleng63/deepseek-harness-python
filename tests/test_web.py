@@ -135,6 +135,7 @@ def test_session_export_download_contains_root_and_descendants(tmp_path) -> None
                 "session.prompt",
                 {
                     "sessionId": "export-root",
+                    "mode": "queue",
                     "content": [{"type": "text", "text": "export me"}],
                 },
             )

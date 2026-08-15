@@ -18,7 +18,7 @@ import httpx
 
 from ..agent import Agent
 from ..agent_presets import AgentPresetError, AgentPresetRegistry
-from ..attachments import AttachmentError, AttachmentStore, ImageAttachment
+from ..attachments import IMAGE_MEDIA_TYPES, AttachmentError, AttachmentStore, ImageAttachment
 from ..errors import HarnessError
 from ..goals import GoalError, GoalManager
 from ..llm import DeepSeekAdapter, LlmCallConfig
@@ -361,7 +361,7 @@ class HarnessService:
         if before_seq is None:
             result["projections"] = {
                 "asOfSeq": handle.session.seq - 1,
-                "values": {"goal": self.goals.fold(handle.session).projection()},
+                "values": self._projection_values(handle.session),
             }
         return result
 
@@ -745,7 +745,14 @@ class HarnessService:
                         "sessionId": session_id,
                         "key": "goal",
                         "value": self.goals.fold(handle.session).projection(),
-                        "seq": handle.session.seq - 1,
+                        "seq": max(0, handle.session.seq - 1),
+                    }
+                    yield {
+                        "type": "session/projection",
+                        "sessionId": session_id,
+                        "key": "imageLimits",
+                        "value": self._image_limits(),
+                        "seq": max(0, handle.session.seq - 1),
                     }
                     for pending in tuple(self._pending_approvals.values()):
                         if pending.session_id == session_id:
@@ -762,18 +769,26 @@ class HarnessService:
         """Dispatch one wire method while keeping carrier concerns outside."""
 
         if method == "session.list":
+            if "cursor" in payload and not isinstance(payload["cursor"], str):
+                raise ApiFault("bad-request", "cursor must be a string")
             return {"items": await self.list_sessions()}
         if method == "session.search":
-            query = str(payload.get("query", "")).strip()
-            if not query or "\x00" in query:
-                raise ApiFault("bad-request", "search query must be non-empty and contain no NUL")
+            query_value = payload.get("query")
+            if not isinstance(query_value, str):
+                raise ApiFault("bad-request", "query must be a string")
+            query = query_value.strip()
+            if not query or "\x00" in query or len(query) > 500:
+                raise ApiFault(
+                    "bad-request",
+                    "search query must be non-empty, at most 500 characters, and contain no NUL",
+                )
             return await self.search(query)
         if method == "session.create":
-            workspace_id = self._optional_string(payload.get("workspaceId"))
-            requested_cwd = self._optional_string(payload.get("cwd"))
+            workspace_id = self._optional_payload_string(payload, "workspaceId")
+            requested_cwd = self._optional_payload_string(payload, "cwd")
             if workspace_id is not None and requested_cwd is not None:
                 raise ApiFault("bad-request", "session.create accepts workspaceId or cwd, not both")
-            requested_preset = self._optional_string(payload.get("agentPreset"))
+            requested_preset = self._optional_payload_string(payload, "agentPreset")
             if requested_preset is None:
                 configured_preset = self.settings.get_value_sync("agent-presets").get("default")
                 if isinstance(configured_preset, str) and configured_preset:
@@ -787,7 +802,7 @@ class HarnessService:
                         "workspace-not-found", str(exc), {"workspaceId": workspace_id}
                     ) from exc
             handle = await self.create_session(
-                session_id=self._optional_string(payload.get("sessionId")),
+                session_id=self._optional_payload_string(payload, "sessionId"),
                 cwd=workspace_path or requested_cwd,
                 agent_preset=requested_preset,
             )
@@ -803,21 +818,23 @@ class HarnessService:
         if method == "session.history":
             return await self.history(
                 self._required_string(payload, "sessionId"),
-                before_seq=self._optional_int(payload.get("beforeSeq")),
-                max_messages=self._optional_int(payload.get("maxMessages")),
+                before_seq=self._optional_payload_int(payload, "beforeSeq", nonnegative=True),
+                max_messages=self._optional_payload_int(payload, "maxMessages", positive=True),
             )
         if method == "session.prompt":
             content = payload.get("content")
             if not isinstance(content, list):
                 raise ApiFault("bad-request", "session.prompt content must be an array")
-            mode = payload.get("mode", "queue")
+            if "mode" not in payload:
+                raise ApiFault("bad-request", "session.prompt mode is required")
+            mode = payload.get("mode")
             if mode not in {"queue", "steer"}:
                 raise ApiFault("bad-request", "session.prompt mode must be queue or steer")
             return await self.prompt(
                 self._required_string(payload, "sessionId"),
                 content,
                 mode=mode,
-                client_time_zone=self._optional_string(payload.get("clientTimeZone")),
+                client_time_zone=self._optional_payload_string(payload, "clientTimeZone"),
             )
         if method == "session.updateQueue":
             action = payload.get("action")
@@ -836,7 +853,7 @@ class HarnessService:
         if method == "session.fork":
             return await self.fork(
                 self._required_string(payload, "sessionId"),
-                self._optional_int(payload.get("atSeq")),
+                self._optional_payload_int(payload, "atSeq", nonnegative=True),
             )
         if method == "session.cancel":
             return await self.cancel(self._required_string(payload, "sessionId"))
@@ -859,7 +876,7 @@ class HarnessService:
                 )
             provider = self._required_string(payload, "provider")
             model = self._required_string(payload, "model")
-            reasoning_effort = self._optional_string(payload.get("reasoningEffort"))
+            reasoning_effort = self._optional_payload_string(payload, "reasoningEffort")
             if reasoning_effort is not None and reasoning_effort not in {"off", "high", "max"}:
                 raise ApiFault("bad-request", "reasoning effort is not supported")
             self.model = model
@@ -959,7 +976,7 @@ class HarnessService:
             return {"deleted": True}
         if method == "workspace.insertBefore":
             workspace_id = self._required_string(payload, "workspaceId")
-            before = self._optional_string(payload.get("beforeWorkspaceId"))
+            before = self._optional_payload_string(payload, "beforeWorkspaceId")
             try:
                 ids = await self.workspaces.insert_before(workspace_id, before)
             except WorkspaceNotFound as exc:
@@ -1036,7 +1053,7 @@ class HarnessService:
             return await self.settings.open_document()
         if method in {"settings.update", "settings.replace", "settings.mutate"}:
             namespace = self._required_string(payload, "ns")
-            expected = self._optional_int(payload.get("expectedRevision"))
+            expected = self._optional_payload_int(payload, "expectedRevision", nonnegative=True)
             try:
                 if method == "settings.update":
                     patch = payload.get("patch")
@@ -1110,7 +1127,7 @@ class HarnessService:
                     ref = self.goals.create(
                         handle.session,
                         objective,
-                        self._optional_int(payload.get("maxGoalRounds")),
+                        self._optional_payload_int(payload, "maxGoalRounds", positive=True),
                     )
                 else:
                     ref = payload.get("ref")
@@ -1120,11 +1137,18 @@ class HarnessService:
                         objective = payload.get("objective")
                         if objective is not None and not isinstance(objective, str):
                             raise ApiFault("bad-request", "goal objective must be a string")
+                        if objective is not None and not objective.strip():
+                            raise ApiFault("bad-request", "goal objective must be non-empty")
+                        if objective is None and "maxGoalRounds" not in payload:
+                            raise ApiFault(
+                                "bad-request",
+                                "goal.edit requires objective or maxGoalRounds",
+                            )
                         ref = self.goals.edit(
                             handle.session,
                             ref,
                             objective,
-                            self._optional_int(payload.get("maxGoalRounds")),
+                            self._optional_payload_int(payload, "maxGoalRounds", positive=True),
                         )
                     elif method in {"goal.pause", "goal.resume", "goal.complete"}:
                         operation = method.removeprefix("goal.")
@@ -1241,13 +1265,15 @@ class HarnessService:
                 raise ApiFault("bad-request", "subagent history mode is invalid")
             return await self.history(
                 child,
-                before_seq=self._optional_int(payload.get("beforeSeq")),
-                max_messages=self._optional_int(payload.get("maxMessages")),
+                before_seq=self._optional_payload_int(payload, "beforeSeq", nonnegative=True),
+                max_messages=self._optional_payload_int(payload, "maxMessages", positive=True),
             )
         if method == "subagent.prompt":
             parent = self._required_string(payload, "parentSessionId")
             child = self._required_string(payload, "childSessionId")
             await self._require_child(parent, child)
+            if payload.get("mode") != "continuable":
+                raise ApiFault("bad-request", "subagent prompt mode must be continuable")
             content = payload.get("content")
             if not isinstance(content, list):
                 raise ApiFault("bad-request", "subagent.prompt content must be an array")
@@ -1262,6 +1288,8 @@ class HarnessService:
             parent = self._required_string(payload, "parentSessionId")
             child = self._required_string(payload, "childSessionId")
             await self._require_child(parent, child)
+            if payload.get("mode") != "continuable":
+                raise ApiFault("bad-request", "subagent interrupt mode must be continuable")
             handle = await self.get_session(child)
             if handle.task is not None and not handle.task.done():
                 handle.task.cancel()
@@ -1479,6 +1507,8 @@ class HarnessService:
     ) -> Message:
         if not content:
             raise ApiFault("bad-request", "prompt content cannot be empty")
+        if not all(isinstance(item, dict) for item in content):
+            raise ApiFault("bad-request", "prompt content blocks must be objects")
         image_parts = [item for item in content if item.get("type") == "image"]
         if len(image_parts) > self.attachments.max_images_per_message:
             raise ApiFault("attachment-error", "prompt contains too many images")
@@ -1500,6 +1530,8 @@ class HarnessService:
                 raise ApiFault(
                     "bad-request", "image content must contain mediaType and base64 data"
                 )
+            if "name" in item and not isinstance(item["name"], str):
+                raise ApiFault("bad-request", "image content name must be a string")
             try:
                 raw = AttachmentStore.decode_base64(data)
             except AttachmentError as exc:
@@ -1636,6 +1668,21 @@ class HarnessService:
                 "seq": handle.session.seq - 1,
             }
         )
+
+    def _projection_values(self, session: Session) -> JsonObject:
+        return {
+            "goal": self.goals.fold(session).projection(),
+            "imageLimits": self._image_limits(),
+        }
+
+    def _image_limits(self) -> JsonObject:
+        return {
+            "maxImageBytes": self.attachments.max_image_bytes,
+            "maxImagesPerMessage": self.attachments.max_images_per_message,
+            "maxMessageImageBytes": self.attachments.max_message_image_bytes,
+            "maxImagePixels": self.attachments.max_image_pixels,
+            "mediaTypes": list(IMAGE_MEDIA_TYPES),
+        }
 
     def _publish_settings_changed(self, namespace: str, view: JsonObject) -> None:
         revision = view.get("revision", 0)
@@ -1986,8 +2033,32 @@ class HarnessService:
         return value if isinstance(value, str) else None
 
     @staticmethod
-    def _optional_int(value: Any) -> int | None:
-        return value if isinstance(value, int) and not isinstance(value, bool) else None
+    def _optional_payload_string(payload: JsonObject, key: str) -> str | None:
+        if key not in payload:
+            return None
+        value = payload[key]
+        if not isinstance(value, str):
+            raise ApiFault("bad-request", f"{key} must be a string")
+        return value
+
+    @staticmethod
+    def _optional_payload_int(
+        payload: JsonObject,
+        key: str,
+        *,
+        positive: bool = False,
+        nonnegative: bool = False,
+    ) -> int | None:
+        if key not in payload:
+            return None
+        value = payload[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ApiFault("bad-request", f"{key} must be an integer")
+        if positive and value <= 0:
+            raise ApiFault("bad-request", f"{key} must be positive")
+        if nonnegative and value < 0:
+            raise ApiFault("bad-request", f"{key} must be non-negative")
+        return value
 
     def _ensure_open(self) -> None:
         if self._disposed:
