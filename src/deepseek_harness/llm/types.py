@@ -28,7 +28,7 @@ class ToolSchema:
 @dataclass(frozen=True, slots=True)
 class LlmCallConfig:
     provider: str = "deepseek-official"
-    model: str = "deepseek-chat"
+    model: str = "deepseek-v4-flash"
     max_tokens: int | None = None
     temperature: float | None = None
     top_p: float | None = None

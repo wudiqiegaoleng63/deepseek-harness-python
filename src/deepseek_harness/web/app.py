@@ -29,7 +29,7 @@ def create_app(
     *,
     session_root: str | os.PathLike[str] | None = None,
     cwd: str | os.PathLike[str] | None = None,
-    model: str = "deepseek-chat",
+    model: str = "deepseek-v4-flash",
     permission_mode: PermissionMode = PermissionMode.WORKSPACE_WRITE,
     service: HarnessService | None = None,
     web_dist: str | os.PathLike[str] | None = None,

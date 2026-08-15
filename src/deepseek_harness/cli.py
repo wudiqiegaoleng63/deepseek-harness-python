@@ -22,7 +22,7 @@ app = typer.Typer(no_args_is_help=True, add_completion=False)
 @app.command("headless")
 def headless(
     task: str = typer.Argument(..., help="One task to send to the agent."),
-    model: str = typer.Option("deepseek-chat", "--model", help="DeepSeek model id."),
+    model: str = typer.Option("deepseek-v4-flash", "--model", help="DeepSeek model id."),
     cwd: Path = typer.Option(Path.cwd, "--cwd", help="Workspace directory."),
     session_root: Path | None = typer.Option(
         None, "--session-root", help="JSONL session directory."
@@ -73,7 +73,7 @@ def serve(
     web_dist: Path | None = typer.Option(
         None, "--web-dist", help="Built frontend directory to serve."
     ),
-    model: str = typer.Option("deepseek-chat", "--model", help="Default DeepSeek model."),
+    model: str = typer.Option("deepseek-v4-flash", "--model", help="Default DeepSeek model."),
     permission_mode: PermissionMode = typer.Option(
         PermissionMode.WORKSPACE_WRITE,
         "--permission-mode",
@@ -119,7 +119,11 @@ async def _run_headless(
     adapter = DeepSeekAdapter()
     registry = ToolRegistry()
     policy = WorkspacePolicy(workspace, permission_mode)
-    disposers = install_builtin_tools(registry, policy)
+    disposers = install_builtin_tools(
+        registry,
+        policy,
+        enable_shell=permission_mode is PermissionMode.DANGER_FULL_ACCESS,
+    )
     agent = Agent(
         session,
         adapter,

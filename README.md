@@ -8,16 +8,20 @@ streaming LLM adapters, model-facing tools, and the existing React Web UI.
 The browser frontend remains TypeScript/React; this repository owns the Python
 runtime and the compatible HTTP/SSE host behind it.
 
-## Current development slice
+## Implemented runtime
 
-The first native slice now contains:
+The native Python host now contains:
 
 - reversible hierarchical plugin contexts and serial/waterfall events;
 - provider-neutral messages, tool schemas, and stream chunks;
-- a DeepSeek chat-completions SSE adapter;
-- append-only Session events with atomic JSONL persistence;
-- an Agent loop with tool-call continuation;
-- workspace-bounded `read_file`, `write_file`, and `list_files` tools.
+- a DeepSeek chat-completions SSE adapter with thinking/reasoning controls;
+- append-only Session events with atomic JSONL persistence and forked subagents;
+- an Agent loop with tool-call continuation, cancellation, and queued prompts;
+- workspace-bounded `read_file`, `write_file`, `list_files`, and optional shell tools;
+- the DSH HTTP RPC, WebSocket/SSE event carriers, settings, credentials, workspaces,
+  goals, presets, skills, attachments, and session ZIP export;
+- the original React/TypeScript frontend served with the Python host;
+- a native synchronous `DeepSeekHarness` SDK for embedding the runtime.
 
 Install the development project with `uv`:
 
@@ -32,13 +36,28 @@ With `DEEPSEEK_API_KEY` configured, run one task:
 uv run dsh-python headless "read the README and summarize it"
 ```
 
+Use the same runtime from Python:
+
+```python
+from deepseek_harness import DeepSeekHarness, DeepSeekHarnessConfig
+
+with DeepSeekHarness(
+    DeepSeekHarnessConfig(cwd="/path/to/workspace", model="deepseek-v4-flash")
+) as harness:
+    result = harness.run("Inspect the repository and summarize it.", session_id="demo")
+
+print(result.final_response)
+```
+
 Shell execution is deliberately disabled in `workspace-write` mode until the
 platform sandbox provider is implemented. It can only be explicitly enabled
 with `--permission-mode danger-full-access`.
 
-## Product direction
+## Frontend and compatibility
 
-The target product name is **DeepSeek Harness Python**. User-facing branding
-will change while the internal DSH event and API names remain compatible with
-the TypeScript frontend, so the existing UI can be reused without a second
-protocol rewrite.
+The product name is **DeepSeek Harness Python**. User-facing branding changes
+while the internal DSH event and API names remain compatible with the
+TypeScript frontend, so the existing UI can be reused without a second
+protocol rewrite. Build the frontend from the local TypeScript checkout with
+`uv run dsh-build-frontend --ts-root /home/lsy/deepseek-harness`, then start
+`uv run dsh-python serve --web-dist frontend/dist`.

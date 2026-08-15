@@ -131,7 +131,7 @@ class HarnessService:
         session_root: str | os.PathLike[str],
         *,
         cwd: str | os.PathLike[str] | None = None,
-        model: str = "deepseek-chat",
+        model: str = "deepseek-v4-flash",
         permission_mode: PermissionMode = PermissionMode.WORKSPACE_WRITE,
         adapter_factory: AdapterFactory | None = None,
     ) -> None:
@@ -1536,8 +1536,13 @@ class HarnessService:
     def _attach(self, session: Session) -> SessionHandle:
         workspace = Path(session.header.cwd or self.cwd).expanduser().resolve()
         registry = ToolRegistry()
-        policy = WorkspacePolicy(workspace, self._effective_permission_mode())
-        disposers = install_builtin_tools(registry, policy)
+        permission_mode = self._effective_permission_mode()
+        policy = WorkspacePolicy(workspace, permission_mode)
+        disposers = install_builtin_tools(
+            registry,
+            policy,
+            enable_shell=permission_mode is PermissionMode.DANGER_FULL_ACCESS,
+        )
         selection = session.header.model_selection or self._default_selection()
         provider = selection.get("provider")
         selected_model = selection.get("model")
