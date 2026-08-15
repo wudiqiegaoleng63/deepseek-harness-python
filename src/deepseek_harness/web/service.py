@@ -21,6 +21,7 @@ from ..agent_presets import AgentPresetError, AgentPresetRegistry
 from ..attachments import IMAGE_MEDIA_TYPES, AttachmentError, AttachmentStore, ImageAttachment
 from ..errors import HarnessError
 from ..goals import GoalError, GoalManager
+from ..jobs import JobRegistry
 from ..llm import DeepSeekAdapter, LlmCallConfig
 from ..llm.adapter import LlmAdapter
 from ..models import ImageContent, Message, TextContent
@@ -227,6 +228,7 @@ class HarnessService:
         self._handles: dict[str, SessionHandle] = {}
         self._mux_subscribers: set[asyncio.Queue[Frame]] = set()
         self._host_subscribers: set[asyncio.Queue[Frame]] = set()
+        self.jobs = JobRegistry(on_changed=self._jobs_changed)
         self._lock = asyncio.Lock()
         self._queue_lock = asyncio.Lock()
         self._pending_approvals: dict[str, PendingApproval] = {}
@@ -740,6 +742,13 @@ class HarnessService:
                         "sessionId": session_id,
                         "items": [item.to_dict() for item in handle.queue],
                     }
+                    jobs = self.jobs.list(session_id)
+                    if jobs:
+                        yield {
+                            "type": "session/jobs",
+                            "sessionId": session_id,
+                            "jobs": [job.to_dict() for job in jobs],
+                        }
                     yield {
                         "type": "session/projection",
                         "sessionId": session_id,
@@ -1455,6 +1464,7 @@ class HarnessService:
                 dispose()
             await handle.agent.dispose()
         self._handles.clear()
+        await self.jobs.close()
         self._mux_subscribers.clear()
         self._host_subscribers.clear()
 
@@ -1577,6 +1587,7 @@ class HarnessService:
             registry,
             policy,
             enable_shell=permission_mode is PermissionMode.DANGER_FULL_ACCESS,
+            jobs=self.jobs,
         )
         selection = session.header.model_selection or self._default_selection()
         provider = selection.get("provider")
@@ -1660,6 +1671,24 @@ class HarnessService:
                 "items": [item.to_dict() for item in handle.queue],
             }
         )
+
+    def _jobs_changed(self, owner_session: str | None) -> None:
+        """Mirror the registry's whole visible job set to the mux stream."""
+
+        if owner_session is None:
+            session_ids = tuple(self._handles)
+        elif owner_session in self._handles:
+            session_ids = (owner_session,)
+        else:
+            return
+        for session_id in session_ids:
+            self._publish_mux(
+                {
+                    "type": "session/jobs",
+                    "sessionId": session_id,
+                    "jobs": [job.to_dict() for job in self.jobs.list(session_id)],
+                }
+            )
 
     def _publish_goal_projection(self, handle: SessionHandle) -> None:
         self._publish_mux(
