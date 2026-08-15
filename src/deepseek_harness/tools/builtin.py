@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
+import re
 import shutil
 from collections.abc import Callable
 from pathlib import Path
@@ -67,6 +69,7 @@ def install_builtin_tools(
             )
         ),
     ]
+    disposers.extend(_install_filesystem_tools(registry, policy))
     if enable_shell:
         for name in ("bash", "run_bash"):
             disposers.append(
@@ -97,6 +100,127 @@ def install_builtin_tools(
             )
         disposers.extend(_install_job_tools(registry, jobs))
     return disposers
+
+
+def _install_filesystem_tools(
+    registry: ToolRegistry,
+    policy: WorkspacePolicy,
+) -> list[Callable[[], None]]:
+    """Install the canonical DSH read/write/edit/search tool names."""
+
+    return [
+        registry.register(
+            ToolDefinition(
+                name="read",
+                description="Read a UTF-8 text file with line-numbered content.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "offset": {"type": "integer"},
+                        "limit": {"type": "integer"},
+                    },
+                    "required": ["file_path"],
+                    "additionalProperties": False,
+                },
+                execute=lambda args, ctx: _read_window(args, policy),
+            )
+        ),
+        registry.register(
+            ToolDefinition(
+                name="write",
+                description="Create or fully replace a UTF-8 text file.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["file_path", "content"],
+                    "additionalProperties": False,
+                },
+                execute=lambda args, ctx: _write_canonical(args, policy),
+            )
+        ),
+        registry.register(
+            ToolDefinition(
+                name="edit",
+                description=(
+                    "Replace an exact string in a UTF-8 file; use replace_all for repeated matches."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "old_string": {"type": "string"},
+                        "new_string": {"type": "string"},
+                        "replace_all": {"type": "boolean"},
+                    },
+                    "required": ["file_path", "old_string", "new_string"],
+                    "additionalProperties": False,
+                },
+                execute=lambda args, ctx: _edit_file(args, policy),
+            )
+        ),
+        registry.register(
+            ToolDefinition(
+                name="glob",
+                description="Find files by glob pattern, excluding VCS metadata directories.",
+                parameters={
+                    "type": "object",
+                    "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}},
+                    "required": ["pattern"],
+                    "additionalProperties": False,
+                },
+                execute=lambda args, ctx: _glob_files(args, policy),
+            )
+        ),
+        registry.register(
+            ToolDefinition(
+                name="grep",
+                description="Search file contents with a regular expression.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string"},
+                        "path": {"type": "string"},
+                        "include": {"type": "string"},
+                        "max_results": {"type": "integer"},
+                    },
+                    "required": ["pattern"],
+                    "additionalProperties": False,
+                },
+                execute=lambda args, ctx: _grep_files(args, policy),
+            )
+        ),
+        registry.register(
+            ToolDefinition(
+                name="str_replace_editor",
+                description=(
+                    "View, create, replace or insert text in a file using "
+                    "Claude-compatible editor commands."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "enum": ["view", "create", "str_replace", "insert"],
+                        },
+                        "path": {"type": "string"},
+                        "file_text": {"type": "string"},
+                        "insert_line": {"type": "integer"},
+                        "new_str": {"type": "string"},
+                        "old_str": {"type": "string"},
+                        "view_range": {"type": "array"},
+                    },
+                    "required": ["command", "path"],
+                    "additionalProperties": False,
+                },
+                execute=lambda args, ctx: _str_replace_editor(args, policy),
+            )
+        ),
+    ]
 
 
 async def _read_file(args: dict[str, Any], policy: WorkspacePolicy) -> ToolResult:
@@ -311,6 +435,225 @@ async def _job_kill(args: dict[str, Any], jobs: JobRegistry, session_id: str) ->
     if outcome == "already-finished":
         return ToolResult(f"job {job_id} had already finished [{snapshot.status}]")
     return ToolResult(f"requested cancellation of job {job_id} [{snapshot.status}]")
+
+
+async def _read_window(args: dict[str, Any], policy: WorkspacePolicy) -> ToolResult:
+    file_path = args.get("file_path")
+    if not isinstance(file_path, str) or not file_path.strip():
+        return ToolResult("file_path must be a non-empty string", is_error=True)
+    offset = args.get("offset", 1)
+    limit = args.get("limit", 2_000)
+    if not isinstance(offset, int) or offset < 1 or not isinstance(limit, int) or limit < 1:
+        return ToolResult("offset and limit must be positive integers", is_error=True)
+    path = policy.assert_readable(file_path)
+    try:
+        text = await asyncio.to_thread(path.read_text, encoding="utf-8")
+    except UnicodeDecodeError:
+        return ToolResult(f"file is not valid UTF-8: {path}", is_error=True)
+    except OSError as exc:
+        return ToolResult(str(exc), is_error=True)
+    lines = text.splitlines()
+    selected = lines[offset - 1 : offset - 1 + limit]
+    numbered = "\n".join(f"{number}: {line}" for number, line in enumerate(selected, offset))
+    if not numbered:
+        numbered = "(no lines in requested range)"
+    return ToolResult(
+        f"<path>{path}</path>\n<type>file</type>\n<content>\n{numbered}\n</content>\n"
+        f"[lines {offset}-{min(len(lines), offset + len(selected) - 1)} of {len(lines)}]"
+    )
+
+
+async def _write_canonical(args: dict[str, Any], policy: WorkspacePolicy) -> ToolResult:
+    file_path = args.get("file_path")
+    content = args.get("content")
+    if not isinstance(file_path, str) or not file_path.strip():
+        return ToolResult("file_path must be a non-empty string", is_error=True)
+    if not isinstance(content, str):
+        return ToolResult("content must be a string", is_error=True)
+    path = policy.assert_writable(file_path)
+    existed = await asyncio.to_thread(path.exists)
+    await asyncio.to_thread(_write_text, path, content)
+    operation = "update" if existed else "create"
+    return ToolResult(
+        f"<path>{path}</path>\n<type>file</type>\n<content>\n{operation.title()}d file\n</content>"
+    )
+
+
+async def _edit_file(args: dict[str, Any], policy: WorkspacePolicy) -> ToolResult:
+    file_path = args.get("file_path")
+    old_string = args.get("old_string")
+    new_string = args.get("new_string")
+    replace_all = args.get("replace_all", False)
+    if not isinstance(file_path, str) or not file_path.strip():
+        return ToolResult("file_path must be a non-empty string", is_error=True)
+    if not isinstance(old_string, str) or not old_string:
+        return ToolResult("old_string must be a non-empty string", is_error=True)
+    if not isinstance(new_string, str) or old_string == new_string:
+        return ToolResult("new_string must be a different string", is_error=True)
+    if not isinstance(replace_all, bool):
+        return ToolResult("replace_all must be a boolean", is_error=True)
+    path = policy.assert_writable(file_path)
+    try:
+        original = await asyncio.to_thread(path.read_text, encoding="utf-8")
+    except OSError as exc:
+        return ToolResult(str(exc), is_error=True)
+    matches = original.count(old_string)
+    if matches == 0:
+        return ToolResult("old_string was not found in the file", is_error=True)
+    if matches > 1 and not replace_all:
+        return ToolResult(
+            f"old_string appeared {matches} times; provide a more specific string "
+            "or set replace_all=true",
+            is_error=True,
+        )
+    updated = original.replace(old_string, new_string, -1 if replace_all else 1)
+    await asyncio.to_thread(_write_text, path, updated)
+    return ToolResult(f"The file {path} has been updated successfully ({matches} replacement(s)).")
+
+
+async def _glob_files(args: dict[str, Any], policy: WorkspacePolicy) -> ToolResult:
+    pattern = args.get("pattern")
+    raw_root = args.get("path", ".")
+    if not isinstance(pattern, str) or not pattern.strip():
+        return ToolResult("pattern must be a non-empty string", is_error=True)
+    if not isinstance(raw_root, str) or not raw_root.strip():
+        return ToolResult("path must be a non-empty string", is_error=True)
+    root = policy.assert_readable(raw_root)
+    try:
+        paths = await asyncio.to_thread(_collect_glob, root, pattern)
+    except OSError as exc:
+        return ToolResult(str(exc), is_error=True)
+    return ToolResult("\n".join(paths) if paths else "No files found")
+
+
+def _collect_glob(root: Path, pattern: str) -> list[str]:
+    result: list[str] = []
+    for path in root.rglob("*"):
+        if not path.is_file() or any(
+            part in {".git", ".svn", ".hg", ".bzr", ".jj", ".sl"} for part in path.parts
+        ):
+            continue
+        relative = path.relative_to(root).as_posix()
+        matched = (
+            fnmatch.fnmatch(path.name, pattern)
+            if "/" not in pattern
+            else fnmatch.fnmatch(relative, pattern)
+        )
+        if matched:
+            result.append(relative)
+    return sorted(result)
+
+
+async def _grep_files(args: dict[str, Any], policy: WorkspacePolicy) -> ToolResult:
+    pattern = args.get("pattern")
+    raw_root = args.get("path", ".")
+    include = args.get("include")
+    max_results = args.get("max_results", 200)
+    if not isinstance(pattern, str) or not pattern:
+        return ToolResult("pattern must be a non-empty string", is_error=True)
+    if not isinstance(raw_root, str) or not raw_root.strip():
+        return ToolResult("path must be a non-empty string", is_error=True)
+    if include is not None and (
+        not isinstance(include, str) or not include.strip() or include.startswith("!")
+    ):
+        return ToolResult("include must be one positive glob", is_error=True)
+    if not isinstance(max_results, int) or max_results < 1:
+        return ToolResult("max_results must be a positive integer", is_error=True)
+    try:
+        expression = re.compile(pattern)
+    except re.error as exc:
+        return ToolResult(f"invalid regular expression: {exc}", is_error=True)
+    root = policy.assert_readable(raw_root)
+    try:
+        matches = await asyncio.to_thread(_collect_grep, root, expression, include, max_results)
+    except OSError as exc:
+        return ToolResult(str(exc), is_error=True)
+    if not matches:
+        return ToolResult("No matches found")
+    suffix = f"\n[showing {len(matches)} matches]"
+    return ToolResult("\n".join(matches) + suffix)
+
+
+def _collect_grep(
+    root: Path,
+    expression: re.Pattern[str],
+    include: str | None,
+    max_results: int,
+) -> list[str]:
+    candidates = [root] if root.is_file() else list(root.rglob("*"))
+    matches: list[str] = []
+    for path in candidates:
+        if len(matches) >= max_results or not path.is_file():
+            continue
+        if any(part in {".git", ".svn", ".hg", ".bzr", ".jj", ".sl"} for part in path.parts):
+            continue
+        if include is not None and not fnmatch.fnmatch(path.name, include):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        display = path.name if root.is_file() else path.relative_to(root).as_posix()
+        for line_number, line in enumerate(text.splitlines(), 1):
+            if expression.search(line):
+                matches.append(f"{display}:{line_number}:{line}")
+                if len(matches) >= max_results:
+                    break
+    return matches
+
+
+async def _str_replace_editor(args: dict[str, Any], policy: WorkspacePolicy) -> ToolResult:
+    command = args.get("command")
+    raw_path = args.get("path")
+    if command not in {"view", "create", "str_replace", "insert"}:
+        return ToolResult("command must be view, create, str_replace, or insert", is_error=True)
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return ToolResult("path must be a non-empty string", is_error=True)
+    if command == "view":
+        path = policy.assert_readable(raw_path)
+        if path.is_dir():
+            entries = await asyncio.to_thread(lambda: sorted(item.name for item in path.iterdir()))
+            return ToolResult("\n".join(entries) or "(empty directory)")
+        view_range = args.get("view_range")
+        if view_range is not None and (
+            not isinstance(view_range, list)
+            or len(view_range) not in {2}
+            or not all(isinstance(item, int) for item in view_range)
+        ):
+            return ToolResult("view_range must be [start_line, end_line]", is_error=True)
+        read_args: dict[str, Any] = {"file_path": raw_path}
+        if isinstance(view_range, list):
+            read_args["offset"] = max(1, view_range[0])
+            if view_range[1] != -1:
+                read_args["limit"] = max(1, view_range[1] - view_range[0] + 1)
+        return await _read_window(read_args, policy)
+    if command == "create":
+        return await _write_canonical(
+            {"file_path": raw_path, "content": args.get("file_text", "")}, policy
+        )
+    if command == "str_replace":
+        return await _edit_file(
+            {
+                "file_path": raw_path,
+                "old_string": args.get("old_str"),
+                "new_string": args.get("new_str", ""),
+            },
+            policy,
+        )
+    insert_line = args.get("insert_line")
+    new_str = args.get("new_str")
+    if not isinstance(insert_line, int) or insert_line < 0 or not isinstance(new_str, str):
+        return ToolResult("insert requires a non-negative insert_line and new_str", is_error=True)
+    path = policy.assert_writable(raw_path)
+    try:
+        original = await asyncio.to_thread(path.read_text, encoding="utf-8")
+    except OSError as exc:
+        return ToolResult(str(exc), is_error=True)
+    lines = original.splitlines(keepends=True)
+    index = min(insert_line, len(lines))
+    lines.insert(index, new_str if new_str.endswith("\n") else f"{new_str}\n")
+    await asyncio.to_thread(_write_text, path, "".join(lines))
+    return ToolResult(f"The file {path} has been updated successfully.")
 
 
 def _write_text(path: Path, content: str) -> None:
