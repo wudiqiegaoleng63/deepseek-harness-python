@@ -161,3 +161,40 @@ def test_settings_and_credentials_survive_service_restart(tmp_path) -> None:
         await second.dispose()
 
     asyncio.run(scenario())
+
+
+def test_skill_list_discovers_project_frontmatter_and_filters_model_only_skills(tmp_path) -> None:
+    skills_root = tmp_path / ".agents" / "skills"
+    (skills_root / "review").mkdir(parents=True)
+    (skills_root / "review" / "SKILL.md").write_text(
+        "---\n"
+        "name: review\n"
+        "description: Review changed files\n"
+        "whenToUse: before merging\n"
+        "---\n\nInstructions\n",
+        encoding="utf-8",
+    )
+    (skills_root / "private").mkdir()
+    (skills_root / "private" / "SKILL.md").write_text(
+        "---\nname: private\ndescription: Private helper\nuser-invocable: false\n---\n",
+        encoding="utf-8",
+    )
+
+    async def scenario() -> None:
+        service = HarnessService(tmp_path / "state", cwd=tmp_path)
+        await service.dispatch(
+            "session.create",
+            {"sessionId": "skill-session", "cwd": str(tmp_path)},
+        )
+        value = await service.dispatch("skill.list", {"sessionId": "skill-session"})
+        assert value["skills"] == [
+            {
+                "name": "review",
+                "description": "Review changed files",
+                "whenToUse": "before merging",
+                "modelInvocable": True,
+            }
+        ]
+        await service.dispose()
+
+    asyncio.run(scenario())

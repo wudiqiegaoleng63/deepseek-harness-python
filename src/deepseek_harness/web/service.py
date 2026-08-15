@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
+import json
 import os
 import uuid
+import zipfile
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -29,6 +32,7 @@ from ..settings import (
     SettingsNotFound,
     SettingsRegistry,
 )
+from ..skills import SkillRegistry
 from ..tools import PermissionMode, WorkspacePolicy, install_builtin_tools
 from ..tools.registry import ToolRegistry
 from ..workspace import (
@@ -72,6 +76,45 @@ class QueueItem:
             "id": self.message.id,
             "placement": self.placement,
             "message": self.message.to_dict(),
+        }
+
+
+ApprovalOutcome = Literal["allowed-once", "rejected", "cancelled", "unavailable"]
+
+
+@dataclass(slots=True)
+class PendingApproval:
+    rpc_id: str
+    session_id: str
+    approval_id: str
+    tool_name: str
+    call_id: str | None
+    reason: str | None
+    future: asyncio.Future[ApprovalOutcome]
+
+    def frame(self) -> Frame:
+        return {
+            "type": "approval/requested",
+            "sessionId": self.session_id,
+            "approvalId": self.approval_id,
+            "toolName": self.tool_name,
+            **({"callId": self.call_id} if self.call_id is not None else {}),
+            **({"reason": self.reason} if self.reason is not None else {}),
+        }
+
+
+@dataclass(slots=True)
+class PendingQuestion:
+    rpc_id: str
+    session_id: str
+    questions: list[JsonObject]
+    future: asyncio.Future[JsonObject]
+
+    def frame(self) -> Frame:
+        return {
+            "type": "question/requested",
+            "sessionId": self.session_id,
+            "questions": self.questions,
         }
 
 
@@ -142,9 +185,7 @@ class HarnessService:
             "ui-theme",
             schema={
                 "type": "object",
-                "properties": {
-                    "preference": {"enum": ["light", "dark", "system"]}
-                },
+                "properties": {"preference": {"enum": ["light", "dark", "system"]}},
             },
             base={"preference": "system"},
         )
@@ -181,12 +222,15 @@ class HarnessService:
         self.settings.register("web-search-deepseek", schema={"type": "object"}, base={})
         self.credentials = CredentialStore(state_root)
         self.workspaces = WorkspaceRegistry(state_root)
+        self.skills = SkillRegistry()
         self._adapter_factory = adapter_factory or self._default_adapter
         self._handles: dict[str, SessionHandle] = {}
         self._mux_subscribers: set[asyncio.Queue[Frame]] = set()
         self._host_subscribers: set[asyncio.Queue[Frame]] = set()
         self._lock = asyncio.Lock()
         self._queue_lock = asyncio.Lock()
+        self._pending_approvals: dict[str, PendingApproval] = {}
+        self._pending_questions: dict[str, PendingQuestion] = {}
         self._disposed = False
 
     async def create_session(
@@ -373,6 +417,79 @@ class HarnessService:
             task.cancel()
         return {"accepted": True}
 
+    async def request_approval(
+        self,
+        session_id: str,
+        tool_name: str,
+        *,
+        approval_id: str | None = None,
+        call_id: str | None = None,
+        reason: str | None = None,
+    ) -> ApprovalOutcome:
+        """Suspend an integration-owned action until the browser responds."""
+
+        handle = await self.get_session(session_id)
+        if not tool_name.strip():
+            raise ApiFault("bad-request", "approval tool name cannot be empty")
+        resolved_id = approval_id or f"approval-{uuid.uuid4().hex}"
+        rpc_id = str(uuid.uuid4())
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[ApprovalOutcome] = loop.create_future()
+        pending = PendingApproval(
+            rpc_id,
+            session_id,
+            resolved_id,
+            tool_name,
+            call_id,
+            reason,
+            future,
+        )
+        asked: JsonObject = {
+            "id": resolved_id,
+            "toolName": tool_name,
+            **({"callId": call_id} if call_id is not None else {}),
+        }
+        if reason is not None:
+            asked["reason"] = reason
+        event = handle.session.append("approval/asked", asked)
+        await self.store.save(handle.session)
+        self._publish_event(session_id, event)
+        self._pending_approvals[rpc_id] = pending
+        self._publish_mux(pending.frame())
+        try:
+            return await future
+        except asyncio.CancelledError:
+            await self._finish_approval(rpc_id, "cancelled")
+            raise
+        finally:
+            if rpc_id in self._pending_approvals:
+                await self._finish_approval(rpc_id, "cancelled")
+
+    async def request_question(
+        self,
+        session_id: str,
+        questions: list[JsonObject],
+    ) -> JsonObject:
+        """Suspend an integration-owned question batch until it is answered."""
+
+        await self.get_session(session_id)
+        if not questions:
+            raise ApiFault("bad-request", "question list cannot be empty")
+        rpc_id = str(uuid.uuid4())
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[JsonObject] = loop.create_future()
+        pending = PendingQuestion(rpc_id, session_id, questions, future)
+        self._pending_questions[rpc_id] = pending
+        self._publish_mux(pending.frame())
+        try:
+            return await future
+        except asyncio.CancelledError:
+            await self._finish_question(rpc_id, "cancelled")
+            raise
+        finally:
+            if rpc_id in self._pending_questions:
+                await self._finish_question(rpc_id, "cancelled")
+
     async def update_queue(
         self,
         session_id: str,
@@ -431,6 +548,141 @@ class HarnessService:
             "attachment": stored.ref.to_dict(),
             "data": base64.b64encode(stored.data).decode("ascii"),
         }
+
+    async def export_zip(self, session_id: str, *, include_descendants: bool = False) -> bytes:
+        """Build the host-only session-log download archive.
+
+        The JSONL bytes are read from the durable artifact after flushing any
+        currently attached session. This keeps exported logs faithful to the
+        persistence format and lets the archive carry the image objects named
+        by its own event records.
+        """
+
+        root = await self.get_session(session_id)
+        artifacts: list[tuple[str, bytes]] = [
+            ("session.jsonl", await self._export_raw_artifact(root.session))
+        ]
+        references: dict[str, ImageAttachment] = {}
+        self._collect_export_attachment_refs(artifacts[0][1], references)
+
+        if include_descendants:
+            pending = [root.session.id]
+            seen = {root.session.id}
+            while pending:
+                parent_id = pending.pop(0)
+                for cold_child in await self._child_sessions(parent_id):
+                    if cold_child.id in seen:
+                        continue
+                    seen.add(cold_child.id)
+                    live_child = self._handles.get(cold_child.id)
+                    child = live_child.session if live_child is not None else cold_child
+                    raw = await self._export_raw_artifact(child)
+                    artifacts.append(
+                        (
+                            f"subagents/{self._safe_archive_segment(child.id)}/session.jsonl",
+                            raw,
+                        )
+                    )
+                    self._collect_export_attachment_refs(raw, references)
+                    pending.append(child.id)
+
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, mode="w", compression=zipfile.ZIP_DEFLATED) as output:
+            for path, content in artifacts:
+                output.writestr(path, content)
+            for reference in references.values():
+                try:
+                    stored = self.attachments.read(reference)
+                except AttachmentError as exc:
+                    raise ApiFault("attachment-error", str(exc), {"reason": exc.code}) from exc
+                extension = {
+                    "image/png": "png",
+                    "image/jpeg": "jpg",
+                    "image/webp": "webp",
+                    "image/gif": "gif",
+                }.get(reference.media_type)
+                if extension is None:
+                    raise ApiFault(
+                        "attachment-error",
+                        "attachment media type is not exportable",
+                        {"reason": "INVALID_IMAGE"},
+                    )
+                output.writestr(f"media/{reference.attachment_id}.{extension}", stored.data)
+        return archive.getvalue()
+
+    async def _export_raw_artifact(self, session: Session) -> bytes:
+        live = self._handles.get(session.id)
+        if live is not None:
+            await self.store.save(live.session)
+        path = self.store.path_for(session.id)
+        try:
+            return await asyncio.to_thread(path.read_bytes)
+        except FileNotFoundError as exc:
+            raise ApiFault(
+                "session-not-found",
+                f"session does not exist: {session.id}",
+                {"sessionId": session.id},
+            ) from exc
+
+    @classmethod
+    def _collect_export_attachment_refs(
+        cls,
+        raw: bytes,
+        references: dict[str, ImageAttachment],
+    ) -> None:
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                if value.get("type") == "image":
+                    attachment = value.get("attachment")
+                    if isinstance(attachment, dict):
+                        attachment_id = attachment.get("attachmentId")
+                        media_type = attachment.get("mediaType")
+                        if (
+                            isinstance(attachment_id, str)
+                            and isinstance(media_type, str)
+                            and all(
+                                isinstance(attachment.get(key), int)
+                                for key in ("bytes", "width", "height")
+                            )
+                        ):
+                            references[attachment_id] = ImageAttachment(
+                                attachment_id,
+                                media_type,
+                                attachment["bytes"],
+                                attachment["width"],
+                                attachment["height"],
+                                attachment.get("name")
+                                if isinstance(attachment.get("name"), str)
+                                else None,
+                            )
+                for child in value.values():
+                    visit(child)
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child)
+
+        for line in text.splitlines():
+            if not line:
+                continue
+            try:
+                visit(json.loads(line))
+            except (TypeError, ValueError):
+                continue
+
+    @staticmethod
+    def _safe_archive_segment(value: str) -> str:
+        return "".join(
+            char if char.isascii() and (char.isalnum() or char in "_-") else "_" for char in value
+        )
+
+    @classmethod
+    def export_filename(cls, session_id: str) -> str:
+        return f"dsh-session-{cls._safe_archive_segment(session_id)}.zip"
 
     async def fork(self, session_id: str, at_seq: int | None = None) -> JsonObject:
         source_handle = await self.get_session(session_id)
@@ -495,6 +747,12 @@ class HarnessService:
                         "value": self.goals.fold(handle.session).projection(),
                         "seq": handle.session.seq - 1,
                     }
+                    for pending in tuple(self._pending_approvals.values()):
+                        if pending.session_id == session_id:
+                            yield pending.frame()
+                    for pending in tuple(self._pending_questions.values()):
+                        if pending.session_id == session_id:
+                            yield pending.frame()
             while True:
                 yield await queue.get()
         finally:
@@ -751,8 +1009,10 @@ class HarnessService:
             )
             return {"archivedSessionIds": list(archived)}
         if method == "skill.list":
-            await self.get_session(self._required_string(payload, "sessionId"))
-            return {"skills": []}
+            session = await self.get_session(self._required_string(payload, "sessionId"))
+            cwd = session.session.header.cwd or str(self.cwd)
+            skills = await self.skills.list(cwd)
+            return {"skills": [skill.to_wire() for skill in skills]}
         if method == "settings.describe":
             exposed = {
                 "ui-onboarding",
@@ -1013,20 +1273,145 @@ class HarnessService:
         raise ApiFault("bad-request", f"unsupported RPC method: {method}")
 
     async def respond(self, message: JsonObject) -> JsonObject:
-        """Accept the client-response carrier shape.
+        """Route a client-response to the pending approval/question registry."""
 
-        Approval/question providers are optional capabilities in this Python
-        slice.  Keeping the correlation endpoint explicit still gives the
-        browser the same receipt semantics and leaves a single insertion point
-        for those providers.
-        """
+        rpc_id = message.get("rpcId")
+        if not isinstance(rpc_id, str):
+            return {"accepted": False, "reason": "bad-response"}
+        result = message.get("result")
+        if not isinstance(result, dict):
+            return {"accepted": False, "reason": "bad-response"}
 
-        return {"accepted": False, "reason": "not-pending"}
+        approval = self._pending_approvals.get(rpc_id)
+        if approval is not None:
+            if result.get("ok") is not True:
+                return {"accepted": False, "reason": "bad-response"}
+            value = result.get("value")
+            if not isinstance(value, dict):
+                return {"accepted": False, "reason": "bad-response"}
+            if (
+                value.get("sessionId") != approval.session_id
+                or value.get("approvalId") != approval.approval_id
+                or value.get("outcome") not in {"allowed-once", "rejected"}
+            ):
+                return {"accepted": False, "reason": "bad-response"}
+            await self._finish_approval(rpc_id, cast(ApprovalOutcome, value["outcome"]))
+            return {"accepted": True}
+
+        question = self._pending_questions.get(rpc_id)
+        if question is None:
+            return {"accepted": False, "reason": "not-pending"}
+        if result.get("ok") is not True:
+            error = result.get("error")
+            if not isinstance(error, dict) or error.get("code") != "cancelled":
+                return {"accepted": False, "reason": "bad-response"}
+            await self._finish_question(rpc_id, "cancelled")
+            return {"accepted": True}
+        value = result.get("value")
+        if not isinstance(value, dict):
+            return {"accepted": False, "reason": "bad-response"}
+        session_id = value.get("sessionId")
+        answer = value.get("answer")
+        if session_id != question.session_id or not isinstance(answer, dict):
+            return {"accepted": False, "reason": "bad-response"}
+        if not self._matches_question_answer(question.questions, answer):
+            return {"accepted": False, "reason": "bad-response"}
+        await self._finish_question(rpc_id, "answered", answer)
+        return {"accepted": True}
+
+    async def _finish_approval(self, rpc_id: str, outcome: ApprovalOutcome) -> None:
+        pending = self._pending_approvals.pop(rpc_id, None)
+        if pending is None:
+            return
+        handle = self._handles.get(pending.session_id)
+        if handle is not None:
+            event = handle.session.append(
+                "approval/decided",
+                {"id": pending.approval_id, "outcome": outcome},
+            )
+            await self.store.save(handle.session)
+            self._publish_event(pending.session_id, event)
+        self._publish_mux(
+            {
+                "type": "approval/resolved",
+                "sessionId": pending.session_id,
+                "approvalId": pending.approval_id,
+                "outcome": outcome,
+            }
+        )
+        if not pending.future.done():
+            pending.future.set_result(outcome)
+
+    async def _finish_question(
+        self,
+        rpc_id: str,
+        outcome: Literal["answered", "cancelled"],
+        answer: JsonObject | None = None,
+    ) -> None:
+        pending = self._pending_questions.pop(rpc_id, None)
+        if pending is None:
+            return
+        self._publish_mux(
+            {
+                "type": "question/resolved",
+                "sessionId": pending.session_id,
+                "questionRpcId": pending.rpc_id,
+                "outcome": outcome,
+            }
+        )
+        if not pending.future.done():
+            if outcome == "answered" and answer is not None:
+                pending.future.set_result(answer)
+            else:
+                pending.future.set_exception(
+                    ApiFault("cancelled", "the user cancelled the pending question")
+                )
+
+    @staticmethod
+    def _matches_question_answer(questions: list[JsonObject], answer: JsonObject) -> bool:
+        answers = answer.get("answers")
+        if not isinstance(answers, list) or len(answers) != len(questions):
+            return False
+        for question, candidate in zip(questions, answers, strict=True):
+            if not isinstance(candidate, dict):
+                return False
+            if candidate.get("id") != question.get("id"):
+                return False
+            selected = candidate.get("selected")
+            if not isinstance(selected, list) or not all(
+                isinstance(item, str) for item in selected
+            ):
+                return False
+            if len(set(selected)) != len(selected):
+                return False
+            custom = candidate.get("custom")
+            if custom is not None and (not isinstance(custom, str) or not custom.strip()):
+                return False
+            if question.get("multiSelect") is not True:
+                if len(selected) > 1 or (custom is not None and selected):
+                    return False
+            options = question.get("options")
+            labels = (
+                {
+                    option.get("label")
+                    for option in options
+                    if isinstance(option, dict) and isinstance(option.get("label"), str)
+                }
+                if isinstance(options, list)
+                else set()
+            )
+            if any(item not in labels for item in selected):
+                return False
+        return True
 
     async def dispose(self) -> None:
         if self._disposed:
             return
         self._disposed = True
+        for rpc_id in tuple(self._pending_approvals):
+            await self._finish_approval(rpc_id, "cancelled")
+        for rpc_id in tuple(self._pending_questions):
+            await self._finish_question(rpc_id, "cancelled")
         handles = tuple(self._handles.values())
         for handle in handles:
             if handle.task is not None and not handle.task.done():
@@ -1161,17 +1546,13 @@ class HarnessService:
         llm_settings = self.settings.get_value_sync("llm-deepseek")
         configured_max_tokens = llm_settings.get("maxTokens")
         configured_thinking = llm_settings.get("thinking")
-        configured_effort = selection.get("reasoningEffort") or llm_settings.get(
-            "reasoningEffort"
-        )
+        configured_effort = selection.get("reasoningEffort") or llm_settings.get("reasoningEffort")
         max_tokens = configured_max_tokens if isinstance(configured_max_tokens, int) else None
-        thinking = (
-            configured_thinking
-            if configured_thinking in {"enabled", "disabled"}
-            else None
-        )
+        thinking = configured_thinking if configured_thinking in {"enabled", "disabled"} else None
         reasoning_effort = (
-            configured_effort if configured_effort in {"off", "high", "max"} else None
+            cast(Literal["off", "high", "max"], configured_effort)
+            if configured_effort in {"off", "high", "max"}
+            else None
         )
         agent = Agent(
             session,
@@ -1369,13 +1750,13 @@ class HarnessService:
 
     @staticmethod
     def _fork_end_seq(session: Session, at_seq: int | None) -> int:
-        completed = [
-            event.seq
-            for event in session.events
-            if event.type == "turn/end"
-            and isinstance(event.data.get("reason"), dict)
-            and event.data["reason"].get("kind") in {"completed", "max-tokens"}
-        ]
+        completed: list[int] = []
+        for event in session.events:
+            if event.type != "turn/end":
+                continue
+            reason = event.data.get("reason")
+            if isinstance(reason, dict) and reason.get("kind") in {"completed", "max-tokens"}:
+                completed.append(event.seq)
         if not completed:
             raise ApiFault("fork-unavailable", "session has no completed turn")
         if at_seq is None or at_seq >= session.seq:

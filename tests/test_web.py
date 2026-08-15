@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from io import BytesIO
+from zipfile import ZipFile
 
 import httpx
 
@@ -109,6 +111,134 @@ def test_fastapi_serves_python_branded_frontend_and_boot_graph(tmp_path) -> None
             assert '"rev":"test"' in index.text
             bundle = await client.get("/plugins/plugin/client.js")
             assert bundle.text == "window.testPlugin = true"
+        await service.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_session_export_download_contains_root_and_descendants(tmp_path) -> None:
+    async def scenario() -> None:
+        service = HarnessService(
+            tmp_path / "sessions",
+            cwd=tmp_path,
+            adapter_factory=lambda _model: ScriptedAdapter(),
+        )
+        app = create_app(service=service)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            await service.dispatch(
+                "session.create",
+                {"sessionId": "export-root", "cwd": str(tmp_path)},
+            )
+            await service.dispatch(
+                "session.prompt",
+                {
+                    "sessionId": "export-root",
+                    "content": [{"type": "text", "text": "export me"}],
+                },
+            )
+            root = await service.get_session("export-root")
+            assert root.task is not None
+            await root.task
+            await service.dispatch("session.fork", {"sessionId": "export-root"})
+
+            head = await client.head(
+                "/api/session.export",
+                params={"sessionId": "export-root", "includeDescendants": "true"},
+            )
+            assert head.status_code == 200
+            assert head.headers["content-type"] == "application/zip"
+            assert "dsh-session-export-root.zip" in head.headers["content-disposition"]
+
+            response = await client.get(
+                "/api/session.export",
+                params={"sessionId": "export-root", "includeDescendants": "true"},
+            )
+            assert response.status_code == 200
+            with ZipFile(BytesIO(response.content)) as archive:
+                names = set(archive.namelist())
+                assert "session.jsonl" in names
+                assert any(name.startswith("subagents/") for name in names)
+                assert b"export me" in archive.read("session.jsonl")
+
+            missing = await client.get(
+                "/api/session.export", params={"sessionId": "does-not-exist"}
+            )
+            assert missing.status_code == 404
+        await service.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_respond_resolves_approval_and_question_requests(tmp_path) -> None:
+    async def scenario() -> None:
+        service = HarnessService(tmp_path / "sessions", cwd=tmp_path)
+        await service.dispatch("session.create", {"sessionId": "interactive", "cwd": str(tmp_path)})
+        app = create_app(service=service)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            approval_task = asyncio.create_task(
+                service.request_approval(
+                    "interactive",
+                    "write_file",
+                    approval_id="approval-1",
+                    reason="the model wants to modify a file",
+                )
+            )
+            while not service._pending_approvals:
+                await asyncio.sleep(0)
+            approval_rpc = next(iter(service._pending_approvals))
+            approval_response = await client.post(
+                "/api/respond",
+                json={
+                    "type": "client-response",
+                    "rpcId": approval_rpc,
+                    "result": {
+                        "ok": True,
+                        "value": {
+                            "sessionId": "interactive",
+                            "approvalId": "approval-1",
+                            "outcome": "allowed-once",
+                        },
+                    },
+                },
+            )
+            assert approval_response.json() == {"accepted": True}
+            assert await approval_task == "allowed-once"
+
+            question_task = asyncio.create_task(
+                service.request_question(
+                    "interactive",
+                    [
+                        {
+                            "id": "color",
+                            "question": "Which color?",
+                            "options": [{"label": "blue"}, {"label": "green"}],
+                        }
+                    ],
+                )
+            )
+            while not service._pending_questions:
+                await asyncio.sleep(0)
+            question_rpc = next(iter(service._pending_questions))
+            question_response = await client.post(
+                "/api/respond",
+                json={
+                    "type": "client-response",
+                    "rpcId": question_rpc,
+                    "result": {
+                        "ok": True,
+                        "value": {
+                            "sessionId": "interactive",
+                            "answer": {"answers": [{"id": "color", "selected": ["blue"]}]},
+                        },
+                    },
+                },
+            )
+            assert question_response.json() == {"accepted": True}
+            assert await question_task == {"answers": [{"id": "color", "selected": ["blue"]}]}
         await service.dispose()
 
     asyncio.run(scenario())

@@ -12,7 +12,13 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 
 from ..tools import PermissionMode
@@ -62,6 +68,32 @@ def create_app(
     @app.websocket("/api/events.host")
     async def host_websocket(socket: WebSocket) -> None:
         await _websocket_stream(socket, runtime.stream("host"))
+
+    @app.api_route("/api/session.export", methods=["GET", "HEAD"], include_in_schema=False)
+    async def session_export(request: Request) -> Response:
+        session_id = request.query_params.get("sessionId")
+        include_descendants = request.query_params.get("includeDescendants")
+        if not session_id:
+            return PlainTextResponse("sessionId is required", status_code=400)
+        if include_descendants not in {None, "true", "false"}:
+            return PlainTextResponse(
+                "includeDescendants must be true or false",
+                status_code=400,
+            )
+        try:
+            data = await runtime.export_zip(
+                session_id,
+                include_descendants=include_descendants == "true",
+            )
+        except ApiFault as exc:
+            status = 404 if exc.code == "session-not-found" else 500
+            return PlainTextResponse(str(exc), status_code=status)
+        headers = {
+            "Content-Disposition": f'attachment; filename="{runtime.export_filename(session_id)}"'
+        }
+        if request.method == "HEAD":
+            return Response(status_code=200, media_type="application/zip", headers=headers)
+        return Response(content=data, media_type="application/zip", headers=headers)
 
     @app.post("/api/{method:path}", response_model=None)
     async def unary(request: Request, method: str) -> JSONResponse | PlainTextResponse:
