@@ -19,6 +19,7 @@ import httpx
 from ..agent import Agent
 from ..agent_presets import AgentPresetError, AgentPresetRegistry
 from ..attachments import IMAGE_MEDIA_TYPES, AttachmentError, AttachmentStore, ImageAttachment
+from ..dynamic_cordis import DynamicCordisService, install_dynamic_tools
 from ..errors import HarnessError
 from ..goals import GoalError, GoalManager
 from ..jobs import JobRegistry
@@ -226,9 +227,14 @@ class HarnessService:
         self.skills = SkillRegistry()
         self._adapter_factory = adapter_factory or self._default_adapter
         self._handles: dict[str, SessionHandle] = {}
+        self._tool_registries: dict[str, ToolRegistry] = {}
         self._mux_subscribers: set[asyncio.Queue[Frame]] = set()
         self._host_subscribers: set[asyncio.Queue[Frame]] = set()
         self.jobs = JobRegistry(on_changed=self._jobs_changed)
+        self.dynamic = DynamicCordisService(
+            tool_registries=self._tool_registries,
+            remote_event=self._publish_remote_event,
+        )
         self._lock = asyncio.Lock()
         self._queue_lock = asyncio.Lock()
         self._pending_approvals: dict[str, PendingApproval] = {}
@@ -1307,9 +1313,92 @@ class HarnessService:
                 handle.task.cancel()
             return {"accepted": True}
         if method == "dynamicCordisRunner/syncInspectManifest":
+            self.dynamic.sync_inspect_manifest(payload.get("providers", []))
             return None
         if method == "dynamicCordisRunner/inventory":
-            return []
+            return self.dynamic.inventory()
+        if method == "dynamicCordisRunner/runHostHalf":
+            request_value = payload.get("requestId")
+            if request_value is not None and not isinstance(request_value, str):
+                raise ApiFault("bad-request", "requestId must be a string or null")
+            return await self.dynamic.run_host_half(
+                self._required_string(payload, "agentId"),
+                self._required_string(payload, "pluginId"),
+                self._required_string(payload, "packageId"),
+                self._required_string(payload, "mode"),
+                request_value,
+                payload.get("approveFutureVersions") is True,
+            )
+        if method == "dynamicCordisRunner/getClientCode":
+            return self.dynamic.get_client_code(
+                self._required_string(payload, "agentId"),
+                self._required_string(payload, "pluginId"),
+                self._required_string(payload, "pluginRunId"),
+            )
+        if method == "dynamicCordisRunner/resolveRequestRun":
+            resolution = payload.get("resolution")
+            if not isinstance(resolution, dict):
+                raise ApiFault("bad-request", "dynamic Cordis resolution must be an object")
+            return await self.dynamic.resolve_request_run(
+                self._required_string(payload, "requestId"), resolution
+            )
+        if method == "dynamicCordisRunner/settleUserRun":
+            resolution = payload.get("resolution")
+            if not isinstance(resolution, dict):
+                raise ApiFault("bad-request", "dynamic Cordis resolution must be an object")
+            return await self.dynamic.settle_user_run(
+                self._required_string(payload, "agentId"),
+                self._required_string(payload, "pluginId"),
+                resolution,
+            )
+        if method == "dynamicCordisRunner/stopFromPanel":
+            return await self.dynamic.stop(
+                self._required_string(payload, "agentId"),
+                self._required_string(payload, "pluginId"),
+            )
+        if method == "dynamicCordisRunner/undefineFromPanel":
+            return await self.dynamic.undefine(
+                self._required_string(payload, "agentId"),
+                self._required_string(payload, "pluginId"),
+            )
+        if method == "dynamicCordisRunner/reportRenderFailure":
+            failure = payload.get("failure")
+            if not isinstance(failure, dict):
+                raise ApiFault("bad-request", "dynamic Cordis render failure must be an object")
+            self.dynamic.report_render_failure(
+                self._required_string(payload, "agentId"),
+                self._required_string(payload, "pluginId"),
+                self._required_string(payload, "pluginRunId"),
+                failure,
+            )
+            return None
+        if method == "dynamicCordisRunner/reportClientGuardFailure":
+            failure = payload.get("failure")
+            if not isinstance(failure, dict):
+                raise ApiFault("bad-request", "dynamic Cordis guard failure must be an object")
+            self.dynamic.report_client_guard_failure(
+                self._required_string(payload, "agentId"),
+                self._required_string(payload, "pluginId"),
+                self._required_string(payload, "pluginRunId"),
+                failure,
+            )
+            return None
+        if method == "dynamicCordisRunner/invoke":
+            return await self.dynamic.invoke(
+                self._required_string(payload, "pluginId"),
+                self._required_string(payload, "pluginRunId"),
+                self._required_string(payload, "method"),
+                payload.get("args"),
+            )
+        if method == "dynamicCordisRunner/resolveInspectQuery":
+            resolution = payload.get("resolution")
+            if not isinstance(resolution, dict):
+                raise ApiFault("bad-request", "dynamic Cordis inspect resolution must be an object")
+            return self.dynamic.resolve_inspect_query(
+                self._required_string(payload, "agentId"),
+                self._required_string(payload, "requestId"),
+                resolution,
+            )
         raise ApiFault("bad-request", f"unsupported RPC method: {method}")
 
     async def respond(self, message: JsonObject) -> JsonObject:
@@ -1464,6 +1553,7 @@ class HarnessService:
                 dispose()
             await handle.agent.dispose()
         self._handles.clear()
+        self._tool_registries.clear()
         await self.jobs.close()
         self._mux_subscribers.clear()
         self._host_subscribers.clear()
@@ -1589,6 +1679,13 @@ class HarnessService:
             enable_shell=permission_mode is PermissionMode.DANGER_FULL_ACCESS,
             jobs=self.jobs,
         )
+        self._tool_registries[session.id] = registry
+
+        def dispose_tool_registry() -> None:
+            self._tool_registries.pop(session.id, None)
+
+        disposers.append(dispose_tool_registry)
+        disposers.extend(install_dynamic_tools(registry, self.dynamic, session.id))
         selection = session.header.model_selection or self._default_selection()
         provider = selection.get("provider")
         selected_model = selection.get("model")
@@ -1662,6 +1759,9 @@ class HarnessService:
     def _publish_host(self, frame: Frame) -> None:
         for queue in tuple(self._host_subscribers):
             queue.put_nowait(frame)
+
+    def _publish_remote_event(self, event: str, args: list[Any]) -> None:
+        self._publish_host({"type": "host/remote-event", "event": event, "args": args})
 
     def _publish_queue(self, handle: SessionHandle) -> None:
         self._publish_mux(
