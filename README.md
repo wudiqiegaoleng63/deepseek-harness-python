@@ -26,6 +26,9 @@ The native Python host now contains:
   turn-scoped `todos` projections, and live mux updates;
 - model-facing `get_goal`, `create_goal`, and CAS-guarded `update_goal` tools,
   including blocked reasons and process-local activation;
+- the model-facing `workflow` tool with an isolated Node VM runner,
+  `agent`/`parallel`/`pipeline` orchestration, structured child schemas, and
+  durable workflow lifecycle events;
 - the foreground `ralph` fresh-agent loop with bounded JSON handoffs and
   durable workflow lifecycle events;
 - event-sourced plan mode with `/plan`, the `plan` projection, dynamic plan

@@ -42,6 +42,12 @@ from ..skills import SkillRegistry
 from ..todos import TodoError, TodoManager
 from ..tools import PermissionMode, WorkspacePolicy, install_builtin_tools
 from ..tools.registry import ToolContext, ToolDefinition, ToolRegistry, ToolResult
+from ..workflow import (
+    WorkflowChildResult,
+    WorkflowError,
+    matches_object_schema,
+    run_workflow,
+)
 from ..workspace import (
     WorkspaceInvalidPath,
     WorkspaceMoveInvalid,
@@ -2289,6 +2295,214 @@ class HarnessService:
             )
         ]
 
+    def _install_workflow_tool(
+        self,
+        registry: ToolRegistry,
+        session: Session,
+    ) -> list[Callable[[], None]]:
+        """Install the JavaScript workflow orchestration tool."""
+
+        async def execute(args: dict[str, Any], context: ToolContext) -> ToolResult:
+            if context.session_id != session.id:
+                raise ApiFault(
+                    "subagent-unauthorized",
+                    "workflow tool context does not belong to the registered session",
+                    {"sessionId": context.session_id},
+                )
+            if session.header.parent_session:
+                raise ValueError(
+                    "workflow requires a direct human turn on a top-level session"
+                )
+            if not self._goal_has_direct_human_turn(session):
+                raise ValueError(
+                    "workflow requires a direct human turn on a top-level session"
+                )
+            script = args.get("script")
+            meta = args.get("meta")
+            workflow_args = args.get("args")
+            if not isinstance(script, str):
+                raise ValueError("workflow script must be a string")
+            if not isinstance(meta, dict):
+                raise ValueError("workflow meta must be an object")
+            if workflow_args is not None and not isinstance(workflow_args, dict):
+                raise ValueError("workflow args must be an object")
+            run_id = f"workflow-{uuid.uuid4().hex}"
+            name = meta.get("name") if isinstance(meta.get("name"), str) else "workflow"
+
+            async def record(event_type: str, data: JsonObject) -> None:
+                event = session.append(event_type, data)
+                self._publish_event(session.id, event)
+                await self.store.save(session)
+
+            await record("tool-workflow/run-start", {"runId": run_id, "name": name})
+            stop_reason = "error"
+            error: str | None = None
+            try:
+                async def event_sink(kind: str, data: dict[str, Any]) -> None:
+                    event_name = {
+                        "phase": "tool-workflow/phase",
+                        "log": "tool-workflow/log",
+                        "agent-start": "tool-workflow/agent-start",
+                        "agent-end": "tool-workflow/agent-end",
+                    }.get(kind)
+                    if event_name is None:
+                        return
+                    await record(event_name, {"runId": run_id, **data})
+
+                async def agent_runner(
+                    prompt: str,
+                    label: str,
+                    options: dict[str, Any],
+                    on_started: Callable[[str], Awaitable[None]],
+                ) -> WorkflowChildResult:
+                    model_selection: JsonObject = {}
+                    for key in ("provider", "model"):
+                        value = options.get(key)
+                        if isinstance(value, str):
+                            model_selection[key] = value
+                    child_id, finish_reason, output = await self._run_fresh_subagent(
+                        await self.get_session(session.id),
+                        label,
+                        prompt,
+                        on_started=on_started,
+                        model_selection=model_selection or None,
+                    )
+                    if finish_reason not in {"completed", "max-tokens"}:
+                        return WorkflowChildResult(
+                            child_id,
+                            False,
+                            error=f"child ended with {finish_reason}",
+                        )
+                    schema = options.get("schema")
+                    if schema is None:
+                        return WorkflowChildResult(child_id, True, output)
+                    value = self._decode_json_text(output)
+                    if value is None or not matches_object_schema(value, schema):
+                        return WorkflowChildResult(
+                            child_id,
+                            False,
+                            error="child did not return a value matching its output schema",
+                        )
+                    return WorkflowChildResult(child_id, True, value)
+
+                result = await run_workflow(
+                    script=script,
+                    meta=meta,
+                    args=workflow_args,
+                    agent_runner=agent_runner,
+                    event_sink=event_sink,
+                )
+                stop_reason = result.stop_reason
+                error = result.error
+                if result.stop_reason != "completed":
+                    detail = result.error or "unknown workflow failure"
+                    return ToolResult(
+                        f'workflow "{name}" failed: {detail}',
+                        is_error=True,
+                        meta={
+                            "runId": run_id,
+                            "agentsStarted": result.agents_started,
+                            "stopReason": result.stop_reason,
+                        },
+                    )
+                rendered = json.dumps(
+                    result.value,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                if len(rendered) > 50_000:
+                    rendered = (
+                        f"{rendered[:50_000]}\n… [truncated: "
+                        f"{len(rendered) - 50_000} more characters]"
+                    )
+                return ToolResult(
+                    f'workflow "{name}" completed ({result.agents_started} '
+                    f"agent{'s' if result.agents_started != 1 else ''}).\n"
+                    f"Return value:\n{rendered}",
+                    meta={
+                        "runId": run_id,
+                        "agentsStarted": result.agents_started,
+                        "result": result.value,
+                    },
+                )
+            except WorkflowError as exc:
+                stop_reason = "error"
+                error = str(exc)
+                raise
+            except Exception as exc:
+                stop_reason = "error"
+                error = str(exc)
+                raise
+            finally:
+                await record(
+                    "tool-workflow/run-end",
+                    {
+                        "runId": run_id,
+                        "stopReason": stop_reason,
+                        **({"error": error} if error is not None else {}),
+                    },
+                )
+
+        return [
+            registry.register(
+                ToolDefinition(
+                    name="workflow",
+                    description=(
+                        "Run a JavaScript workflow script that orchestrates subagents at scale. "
+                        "Use only when the direct human asks for a workflow or large multi-agent "
+                        "fan-out; the script may use agent, pipeline, parallel, phase, and log."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "script": {
+                                "type": "string",
+                                "description": (
+                                    "Plain JavaScript body with top-level await; end with "
+                                    "return <json-value>."
+                                ),
+                            },
+                            "meta": {
+                                "type": "object",
+                                "description": "Workflow identity with name and description.",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "description": {"type": "string"},
+                                    "whenToUse": {"type": "string"},
+                                    "phases": {"type": "array"},
+                                },
+                                "required": ["name", "description"],
+                            },
+                            "args": {
+                                "type": "object",
+                                "description": "Optional JSON input exposed as the args global.",
+                            },
+                        },
+                        "required": ["script", "meta"],
+                        "additionalProperties": False,
+                    },
+                    execute=execute,
+                )
+            )
+        ]
+
+    @staticmethod
+    def _decode_json_text(output: str) -> Any | None:
+        text = output.strip()
+        candidates = [text]
+        if text.startswith("```") and text.endswith("```"):
+            candidates.append(text.strip("`").removeprefix("json").strip())
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            candidates.append(text[start : end + 1])
+        for candidate in candidates:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+        return None
+
     @staticmethod
     def _parse_ralph_report(output: str) -> JsonObject:
         """Decode and enforce the fixed structured Ralph handoff."""
@@ -2842,6 +3056,7 @@ class HarnessService:
         *,
         mode: Literal["one-shot", "continuable"],
         inherit_context: bool,
+        model_selection_override: JsonObject | None = None,
     ) -> SessionHandle:
         depth = await self._subagent_depth(parent.session)
         if depth >= MAX_SUBAGENT_DEPTH:
@@ -2850,7 +3065,7 @@ class HarnessService:
                 f"subagent maximum depth {MAX_SUBAGENT_DEPTH} has been reached",
                 {"sessionId": parent.session.id, "depth": depth},
             )
-        model_selection = parent.session.header.model_selection
+        model_selection = model_selection_override or parent.session.header.model_selection
         if inherit_context:
             end_seq = self._fork_end_seq(parent.session, None)
             prefix = list(parent.session.events[: end_seq + 1])
@@ -2971,6 +3186,7 @@ class HarnessService:
         prompt: str,
         *,
         on_started: Callable[[str], Awaitable[None]] | None = None,
+        model_selection: JsonObject | None = None,
     ) -> tuple[str, str, str]:
         """Run one blank one-shot child and expose its raw final text."""
 
@@ -2979,6 +3195,7 @@ class HarnessService:
             label,
             mode="one-shot",
             inherit_context=False,
+            model_selection_override=model_selection,
         )
         if on_started is not None:
             await on_started(child.session.id)
@@ -3282,6 +3499,7 @@ class HarnessService:
         self._goal_activation.setdefault(session.id, "disarmed")
         disposers.extend(self._install_goal_tools(registry, session))
         disposers.extend(self._install_plan_tools(registry, session))
+        disposers.extend(self._install_workflow_tool(registry, session))
         disposers.extend(self._install_ralph_tool(registry, session))
         disposers.extend(self._install_ask_user_tool(registry, session))
         disposers.extend(self._install_todo_tool(registry, session))
