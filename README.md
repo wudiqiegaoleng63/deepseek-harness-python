@@ -15,9 +15,15 @@ The native Python host now contains:
 - reversible hierarchical plugin contexts and serial/waterfall events;
 - provider-neutral messages, tool schemas, and stream chunks;
 - a DeepSeek chat-completions SSE adapter with thinking/reasoning controls;
-- append-only Session events with atomic JSONL persistence and forked subagents;
+- append-only Session events with atomic JSONL persistence, forked sessions, and
+  durable one-shot/continuable subagents;
 - an Agent loop with tool-call continuation, cancellation, and queued prompts;
-- workspace-bounded `read_file`, `write_file`, `list_files`, and optional shell tools;
+- workspace-bounded canonical DSH `read`, `write`, `edit`, `glob`, `grep`, and
+  `str_replace_editor` tools, plus optional shell and background jobs;
+- model-facing `subagent`, `subagent_fork`, `send_message`, `interrupt_agent`,
+  and `list_agents` tools with parent/ancestor authorization and depth limits;
+- a constrained dynamic Cordis host runtime with package inventory, approvals,
+  dynamic tools, and host/client RPCs;
 - the DSH HTTP RPC, WebSocket/SSE event carriers, settings, credentials, workspaces,
   goals, presets, skills, attachments, and session ZIP export;
 - the original React/TypeScript frontend served with the Python host;

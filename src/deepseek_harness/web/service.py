@@ -22,7 +22,7 @@ from ..attachments import IMAGE_MEDIA_TYPES, AttachmentError, AttachmentStore, I
 from ..dynamic_cordis import DynamicCordisService, install_dynamic_tools
 from ..errors import HarnessError
 from ..goals import GoalError, GoalManager
-from ..jobs import JobRegistry
+from ..jobs import JobHandle, JobOutcome, JobRegistry
 from ..llm import DeepSeekAdapter, LlmCallConfig
 from ..llm.adapter import LlmAdapter
 from ..models import ImageContent, Message, TextContent
@@ -36,7 +36,7 @@ from ..settings import (
 )
 from ..skills import SkillRegistry
 from ..tools import PermissionMode, WorkspacePolicy, install_builtin_tools
-from ..tools.registry import ToolRegistry
+from ..tools.registry import ToolContext, ToolDefinition, ToolRegistry, ToolResult
 from ..workspace import (
     WorkspaceInvalidPath,
     WorkspaceMoveInvalid,
@@ -48,6 +48,9 @@ from ..workspace import (
 JsonObject = dict[str, Any]
 Frame = JsonObject
 AdapterFactory = Callable[[str], LlmAdapter]
+
+SUBAGENT_DESCRIPTOR_VERSION = 2
+MAX_SUBAGENT_DEPTH = 3
 
 
 class ApiFault(HarnessError):
@@ -64,7 +67,7 @@ class SessionHandle:
     session: Session
     agent: Agent
     disposers: list[Callable[[], None]]
-    task: asyncio.Task[None] | None = None
+    task: asyncio.Task[Any] | None = None
     queue: list[QueueItem] = field(default_factory=list)
 
 
@@ -1258,19 +1261,25 @@ class HarnessService:
             await self.get_session(parent)
             children: list[JsonObject] = []
             for child in await self._child_sessions(parent):
+                descriptor = self._subagent_descriptor(child)
                 handle = self._handles.get(child.id)
+                if descriptor is None:
+                    descriptor = {
+                        "mode": "continuable",
+                        "label": child.id,
+                    }
                 children.append(
                     {
                         "kind": "child",
                         "id": child.id,
-                        "mode": "continuable",
+                        "mode": descriptor.get("mode", "one-shot"),
                         "activity": (
                             "running"
                             if handle is not None and handle.agent.status == "running"
                             else "inactive"
                         ),
-                        "hasChildren": False,
-                        "label": child.id,
+                        "hasChildren": bool(await self._child_sessions(child.id)),
+                        "label": descriptor.get("label", child.id),
                     }
                 )
             return {"entries": children, "parentAvailable": True}
@@ -1289,9 +1298,9 @@ class HarnessService:
         if method == "subagent.prompt":
             parent = self._required_string(payload, "parentSessionId")
             child = self._required_string(payload, "childSessionId")
-            await self._require_child(parent, child)
             if payload.get("mode") != "continuable":
                 raise ApiFault("bad-request", "subagent prompt mode must be continuable")
+            await self._require_continuable_child(parent, child)
             content = payload.get("content")
             if not isinstance(content, list):
                 raise ApiFault("bad-request", "subagent.prompt content must be an array")
@@ -1305,9 +1314,9 @@ class HarnessService:
         if method == "subagent.interrupt":
             parent = self._required_string(payload, "parentSessionId")
             child = self._required_string(payload, "childSessionId")
-            await self._require_child(parent, child)
             if payload.get("mode") != "continuable":
                 raise ApiFault("bad-request", "subagent interrupt mode must be continuable")
+            await self._require_continuable_child(parent, child)
             handle = await self.get_session(child)
             if handle.task is not None and not handle.task.done():
                 handle.task.cancel()
@@ -1602,6 +1611,563 @@ class HarnessService:
             if handle.queue and not self._disposed:
                 handle.task = asyncio.create_task(self._run_queue(handle))
 
+    def _install_subagent_tools(
+        self,
+        registry: ToolRegistry,
+        session: Session,
+    ) -> list[Callable[[], None]]:
+        """Install the model-facing subagent and control tools for one session.
+
+        The TS composition keeps these tools in separate Cordis packages.  The
+        Python host has one per-session registry, so the equivalent lifecycle is
+        expressed as a group of disposers owned by ``SessionHandle``.
+        """
+
+        async def run_subagent(
+            args: dict[str, Any],
+            context: ToolContext,
+            *,
+            inherit_context: bool,
+        ) -> ToolResult:
+            parent = await self._tool_parent(context, session)
+            label = self._tool_text_argument(args, "description", maximum=160)
+            prompt = self._tool_text_argument(args, "prompt", maximum=200_000)
+            run_in_background = args.get("run_in_background", True)
+            if not isinstance(run_in_background, bool):
+                raise ValueError("run_in_background must be a boolean")
+            if run_in_background:
+                child_id, job_id = await self._start_background_subagent(
+                    parent,
+                    label,
+                    prompt,
+                    inherit_context=inherit_context,
+                )
+                return ToolResult(
+                    f"started background subagent {child_id}",
+                    meta={
+                        "kind": "continuable",
+                        "subagentId": child_id,
+                        "jobId": job_id,
+                    },
+                )
+            return await self._run_foreground_subagent(
+                parent,
+                label,
+                prompt,
+                inherit_context=inherit_context,
+            )
+
+        async def send_message(args: dict[str, Any], context: ToolContext) -> ToolResult:
+            parent = await self._tool_parent(context, session)
+            child_id = self._tool_text_argument(args, "subagent_id", maximum=160)
+            message = self._tool_text_argument(args, "message", maximum=200_000)
+            await self._require_continuable_child(parent.session.id, child_id)
+            result = await self.prompt(
+                child_id,
+                [{"type": "text", "text": message}],
+                allow_subagent=True,
+                include_message_id=True,
+            )
+            message_id = result.get("messageId")
+            if not isinstance(message_id, str):
+                raise RuntimeError("subagent follow-up did not return a message id")
+            return ToolResult(
+                f"message queued as the next turn for subagent {child_id}",
+                meta={"messageId": message_id, "subagentId": child_id},
+            )
+
+        async def interrupt_agent(args: dict[str, Any], context: ToolContext) -> ToolResult:
+            parent = await self._tool_parent(context, session)
+            target_id = self._tool_text_argument(args, "agent_id", maximum=160)
+            if not await self._is_descendant(parent.session.id, target_id):
+                raise ApiFault(
+                    "subagent-unauthorized",
+                    "agent is not a descendant of the calling session",
+                    {"agentId": target_id},
+                )
+            target = await self.get_session(target_id)
+            if target.task is not None and not target.task.done():
+                target.task.cancel()
+            return ToolResult(
+                f"interrupt requested for agent {target_id}",
+                meta={"accepted": True, "agentId": target_id},
+            )
+
+        async def list_agents(args: dict[str, Any], context: ToolContext) -> ToolResult:
+            parent = await self._tool_parent(context, session)
+            scope = args.get("scope", "children")
+            if scope not in {"children", "descendants"}:
+                raise ValueError("scope must be children or descendants")
+            entries = await self._list_subagent_entries(parent.session.id, scope)
+            if not entries:
+                rendered = "(no subagents)"
+            else:
+                rendered_rows: list[str] = []
+                for entry in entries:
+                    position = ""
+                    if scope == "descendants":
+                        position = (
+                            f" parent={entry.get('parent')} depth={entry.get('depth')}"
+                        )
+                    if entry.get("kind") == "diagnostic":
+                        rendered_rows.append(
+                            f"{entry['id']} [diagnostic: {entry.get('reason')}]{position}"
+                        )
+                    else:
+                        rendered_rows.append(
+                            f"{entry['id']} [{entry.get('status')}]{position}"
+                            f" — {entry.get('label', entry['id'])}"
+                        )
+                rendered = "\n".join(rendered_rows)
+            return ToolResult(rendered, meta={"entries": entries, "scope": scope})
+
+        disposers: list[Callable[[], None]] = []
+        for tool_name, description, inherit_context in (
+            (
+                "subagent",
+                "Delegate a self-contained task to a subagent. It runs in the background by "
+                "default and returns a durable subagent id; set run_in_background to false "
+                "when the result is needed immediately.",
+                False,
+            ),
+            (
+                "subagent_fork",
+                "Delegate a task to a subagent seeded with this conversation's completed turns. "
+                "It runs in the background by default and returns a durable subagent id.",
+                True,
+            ),
+        ):
+            disposers.append(
+                registry.register(
+                    ToolDefinition(
+                        name=tool_name,
+                        description=description,
+                        parameters={
+                            "type": "object",
+                            "properties": {
+                                "description": {
+                                    "type": "string",
+                                    "description": "A short description of the delegated task.",
+                                },
+                                "prompt": {
+                                    "type": "string",
+                                    "description": "The complete task for the subagent.",
+                                },
+                                "run_in_background": {
+                                    "type": "boolean",
+                                    "description": (
+                                        "Whether to return immediately with a durable subagent id."
+                                    ),
+                                },
+                            },
+                            "required": ["description", "prompt"],
+                            "additionalProperties": False,
+                        },
+                        execute=lambda args, context, inherit_context=inherit_context: run_subagent(
+                            args,
+                            context,
+                            inherit_context=inherit_context,
+                        ),
+                    )
+                )
+            )
+
+        disposers.extend(
+            [
+                registry.register(
+                    ToolDefinition(
+                        name="send_message",
+                        description=(
+                            "Send the next-turn message to a background subagent by durable id."
+                        ),
+                        parameters={
+                            "type": "object",
+                            "properties": {
+                                "subagent_id": {"type": "string"},
+                                "message": {"type": "string"},
+                            },
+                            "required": ["subagent_id", "message"],
+                            "additionalProperties": False,
+                        },
+                        execute=send_message,
+                    )
+                ),
+                registry.register(
+                    ToolDefinition(
+                        name="interrupt_agent",
+                        description="Request cancellation of a descendant subagent's current turn.",
+                        parameters={
+                            "type": "object",
+                            "properties": {"agent_id": {"type": "string"}},
+                            "required": ["agent_id"],
+                            "additionalProperties": False,
+                        },
+                        execute=interrupt_agent,
+                    )
+                ),
+                registry.register(
+                    ToolDefinition(
+                        name="list_agents",
+                        description=(
+                            "List direct or descendant continuable subagents and their status."
+                        ),
+                        parameters={
+                            "type": "object",
+                            "properties": {
+                                "scope": {"type": "string", "enum": ["children", "descendants"]}
+                            },
+                            "additionalProperties": False,
+                        },
+                        execute=list_agents,
+                    )
+                ),
+            ]
+        )
+        return disposers
+
+    async def _tool_parent(self, context: ToolContext, expected: Session) -> SessionHandle:
+        if context.session_id != expected.id:
+            raise ApiFault(
+                "subagent-unauthorized",
+                "tool context does not belong to the registered session",
+                {"sessionId": context.session_id},
+            )
+        return await self.get_session(context.session_id)
+
+    @staticmethod
+    def _tool_text_argument(args: dict[str, Any], name: str, *, maximum: int) -> str:
+        value = args.get(name)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} must be a non-empty string")
+        if len(value) > maximum:
+            raise ValueError(f"{name} exceeds the {maximum}-character limit")
+        return value
+
+    async def _prepare_subagent(
+        self,
+        parent: SessionHandle,
+        label: str,
+        *,
+        mode: Literal["one-shot", "continuable"],
+        inherit_context: bool,
+    ) -> SessionHandle:
+        depth = await self._subagent_depth(parent.session)
+        if depth >= MAX_SUBAGENT_DEPTH:
+            raise ApiFault(
+                "subagent-depth-limit",
+                f"subagent maximum depth {MAX_SUBAGENT_DEPTH} has been reached",
+                {"sessionId": parent.session.id, "depth": depth},
+            )
+        model_selection = parent.session.header.model_selection
+        if inherit_context:
+            end_seq = self._fork_end_seq(parent.session, None)
+            prefix = list(parent.session.events[: end_seq + 1])
+            child_id = f"session-{uuid.uuid4().hex}"
+            header = replace(
+                Session.header_for(
+                    child_id,
+                    cwd=parent.session.header.cwd,
+                    parent_session=parent.session.id,
+                    origin="subagent",
+                    agent_preset=parent.session.header.agent_preset,
+                    model_selection=model_selection,
+                ),
+                seed_length=len(prefix),
+            )
+            child = Session(child_id, header=header, events=prefix)
+            await self.store.save(child)
+            async with self._lock:
+                child_handle = self._attach(child)
+            self._publish_host(
+                {
+                    "type": "host/session-added",
+                    "sessionId": child.id,
+                    "blank": self._is_blank(child),
+                    "cwd": child.header.cwd,
+                    "parentSessionId": parent.session.id,
+                    "origin": "subagent",
+                }
+            )
+        else:
+            child_handle = await self.create_session(
+                cwd=parent.session.header.cwd,
+                parent_session=parent.session.id,
+                origin="subagent",
+                agent_preset=parent.session.header.agent_preset,
+                model_selection=model_selection,
+            )
+            child = child_handle.session
+
+        descriptor: JsonObject = {
+            "version": SUBAGENT_DESCRIPTOR_VERSION,
+            "mode": mode,
+            "provider": "python-in-process",
+            "label": label,
+        }
+        descriptor_event = child.append("subagent/descriptor", descriptor)
+        await self.store.save(child)
+        self._publish_event(child.id, descriptor_event)
+        started_event = parent.session.append(
+            "subagent/started",
+            {
+                "childSessionId": child.id,
+                "label": label,
+                "mode": mode,
+                "provider": "python-in-process",
+            },
+        )
+        await self.store.save(parent.session)
+        self._publish_event(parent.session.id, started_event)
+        return child_handle
+
+    async def _run_foreground_subagent(
+        self,
+        parent: SessionHandle,
+        label: str,
+        prompt: str,
+        *,
+        inherit_context: bool,
+    ) -> ToolResult:
+        child = await self._prepare_subagent(
+            parent,
+            label,
+            mode="one-shot",
+            inherit_context=inherit_context,
+        )
+        task = asyncio.create_task(
+            child.agent.run(prompt),
+            name=f"dsh-subagent-{child.session.id}",
+        )
+        child.task = task
+        try:
+            result = await task
+        finally:
+            if child.task is task:
+                child.task = None
+            await self.store.save(child.session)
+        output = result.final_response.strip()
+        reason = result.finish_reason or "completed"
+        if reason == "completed":
+            text = f"subagent {child.session.id} completed"
+            if output:
+                text += f":\n{output}"
+            return ToolResult(
+                text,
+                meta={
+                    "kind": "foreground",
+                    "subagentId": child.session.id,
+                    "finishReason": reason,
+                },
+            )
+        text = f"subagent {child.session.id} ended with {reason}"
+        if output:
+            text += f"\nPartial output:\n{output}"
+        return ToolResult(
+            text,
+            is_error=True,
+            meta={
+                "kind": "foreground",
+                "subagentId": child.session.id,
+                "finishReason": reason,
+            },
+        )
+
+    async def _start_background_subagent(
+        self,
+        parent: SessionHandle,
+        label: str,
+        prompt: str,
+        *,
+        inherit_context: bool,
+    ) -> tuple[str, str]:
+        child_ref: dict[str, SessionHandle] = {}
+
+        async def starter() -> JobHandle:
+            child = await self._prepare_subagent(
+                parent,
+                label,
+                mode="continuable",
+                inherit_context=inherit_context,
+            )
+            child_ref["handle"] = child
+            await self.prompt(
+                child.session.id,
+                [{"type": "text", "text": prompt}],
+                allow_subagent=True,
+            )
+            task = child.task
+            if task is None:
+                raise RuntimeError("background subagent task was not scheduled")
+
+            async def settle() -> JobOutcome:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    return JobOutcome("killed", "subagent turn was cancelled")
+                except Exception as exc:
+                    return JobOutcome("failed", str(exc))
+                finally:
+                    await self.store.save(child.session)
+                reason = self._last_turn_reason(child.session) or "completed"
+                output = self._latest_assistant_text(child.session)
+                if reason == "aborted":
+                    return JobOutcome("killed", "subagent turn was cancelled", output)
+                if reason not in {"completed", "max-tokens"}:
+                    return JobOutcome("failed", f"subagent ended with {reason}", output)
+                return JobOutcome("completed", f"subagent ended with {reason}", output)
+
+            def cancel(_reason: str | None) -> None:
+                task.cancel()
+
+            return JobHandle(cancel=cancel, done=settle())
+
+        job_id = await self.jobs.start(
+            kind="subagent",
+            label=label,
+            owner_session=parent.session.id,
+            starter=starter,
+        )
+        child = child_ref.get("handle")
+        if child is None:
+            raise RuntimeError("background subagent did not publish a child session")
+        return child.session.id, job_id
+
+    async def _require_continuable_child(
+        self,
+        parent_session: str,
+        child_session: str,
+    ) -> SessionHandle:
+        child = await self._require_child(parent_session, child_session)
+        descriptor = self._subagent_descriptor(child.session)
+        if descriptor is None or descriptor.get("mode") != "continuable":
+            raise ApiFault(
+                "subagent-not-resumable",
+                "subagent does not have a continuable descriptor",
+                {"childSessionId": child_session},
+            )
+        return child
+
+    async def _subagent_depth(self, session: Session) -> int:
+        depth = 0
+        current = session
+        visited: set[str] = set()
+        while current.header.parent_session:
+            parent_id = current.header.parent_session
+            if parent_id in visited:
+                break
+            visited.add(parent_id)
+            depth += 1
+            try:
+                current = (await self.get_session(parent_id)).session
+            except ApiFault:
+                break
+        return depth
+
+    async def _is_descendant(self, ancestor_id: str, candidate_id: str) -> bool:
+        if ancestor_id == candidate_id:
+            return False
+        try:
+            current = (await self.get_session(candidate_id)).session
+        except ApiFault:
+            return False
+        visited: set[str] = set()
+        while current.header.parent_session:
+            parent_id = current.header.parent_session
+            if parent_id == ancestor_id:
+                return True
+            if parent_id in visited:
+                return False
+            visited.add(parent_id)
+            try:
+                current = (await self.get_session(parent_id)).session
+            except ApiFault:
+                return False
+        return False
+
+    async def _list_subagent_entries(
+        self,
+        parent_session: str,
+        scope: Literal["children", "descendants"],
+    ) -> list[JsonObject]:
+        entries: list[JsonObject] = []
+        pending: list[tuple[str, int]] = [(parent_session, 0)]
+        while pending:
+            current_id, current_depth = pending.pop(0)
+            for child in await self._child_sessions(current_id):
+                descriptor = self._subagent_descriptor(child)
+                child_depth = current_depth + 1
+                if descriptor is not None:
+                    handle = self._handles.get(child.id)
+                    if handle is None:
+                        status = "ready"
+                    elif handle.agent.status == "running":
+                        status = "running"
+                    else:
+                        status = "idle"
+                    entry: JsonObject = {
+                        "kind": "child",
+                        "id": child.id,
+                        "label": descriptor.get("label", child.id),
+                        "status": status,
+                        "mode": descriptor.get("mode", "one-shot"),
+                    }
+                    if scope == "descendants":
+                        entry["parent"] = current_id
+                        entry["depth"] = child_depth
+                    entries.append(entry)
+                if scope == "descendants":
+                    pending.append((child.id, child_depth))
+        return entries
+
+    @staticmethod
+    def _subagent_descriptor(session: Session) -> JsonObject | None:
+        # A forked child replays its ancestor's model-hidden events as a seed.
+        # Only the descriptor in the child's own suffix classifies it, matching
+        # the TS persistence rule for cold-resumable children.
+        own_events = session.events[session.header.seed_length or 0 :]
+        for event in own_events:
+            if event.type != "subagent/descriptor":
+                continue
+            data = event.data
+            if data.get("version") != SUBAGENT_DESCRIPTOR_VERSION:
+                return None
+            if data.get("mode") not in {"one-shot", "continuable"}:
+                return None
+            if not isinstance(data.get("provider"), str):
+                return None
+            label = data.get("label")
+            if label is not None and not isinstance(label, str):
+                return None
+            if data.get("mode") == "continuable" and not isinstance(label, str):
+                return None
+            return {
+                "version": SUBAGENT_DESCRIPTOR_VERSION,
+                "mode": data["mode"],
+                "provider": data["provider"],
+                **({"label": label} if isinstance(label, str) else {}),
+            }
+        return None
+
+    @staticmethod
+    def _last_turn_reason(session: Session) -> str | None:
+        for event in reversed(session.events):
+            if event.type != "turn/end":
+                continue
+            reason = event.data.get("reason")
+            if isinstance(reason, dict):
+                kind = reason.get("kind")
+                if isinstance(kind, str):
+                    return kind
+        return None
+
+    @staticmethod
+    def _latest_assistant_text(session: Session) -> str | None:
+        messages = [message for message in session.derive_messages() if message.role == "assistant"]
+        if not messages:
+            return None
+        text = messages[-1].text.strip()
+        return text or None
+
     async def _build_message(
         self,
         content: list[JsonObject],
@@ -1685,6 +2251,7 @@ class HarnessService:
             self._tool_registries.pop(session.id, None)
 
         disposers.append(dispose_tool_registry)
+        disposers.extend(self._install_subagent_tools(registry, session))
         disposers.extend(install_dynamic_tools(registry, self.dynamic, session.id))
         selection = session.header.model_selection or self._default_selection()
         provider = selection.get("provider")
