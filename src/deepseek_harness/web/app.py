@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -21,8 +21,11 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 
+from ..llm.adapter import LlmAdapter
 from ..tools import PermissionMode
 from .service import ApiFault, HarnessService
+
+AdapterFactory = Callable[[str], LlmAdapter]
 
 
 def create_app(
@@ -33,12 +36,14 @@ def create_app(
     permission_mode: PermissionMode = PermissionMode.WORKSPACE_WRITE,
     service: HarnessService | None = None,
     web_dist: str | os.PathLike[str] | None = None,
+    adapter_factory: AdapterFactory | None = None,
 ) -> FastAPI:
     runtime = service or HarnessService(
         session_root or os.getenv("DSH_SESSION_ROOT", "~/.deepseek_harness_python/sessions"),
         cwd=cwd,
         model=model,
         permission_mode=permission_mode,
+        adapter_factory=adapter_factory,
     )
 
     @asynccontextmanager

@@ -56,6 +56,11 @@ With `DEEPSEEK_API_KEY` configured, run one task:
 uv run dsh-python headless "read the README and summarize it"
 ```
 
+Both `headless` and `serve` use the same full Harness service runtime. Use
+`--base-url`, `--api-key`, and `--request-timeout` for a DeepSeek-compatible
+endpoint; the corresponding `DEEPSEEK_BASE_URL` and `DEEPSEEK_API_KEY`
+environment variables are supported as well.
+
 Use the same runtime from Python:
 
 ```python

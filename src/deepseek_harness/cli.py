@@ -5,16 +5,15 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 import typer
 
-from .agent import Agent
 from .errors import HarnessError
-from .llm import DeepSeekAdapter, LlmCallConfig
-from .session import JsonlSessionStore
-from .tools import PermissionMode, WorkspacePolicy, install_builtin_tools
-from .tools.registry import ToolRegistry
+from .llm import DeepSeekAdapter, LlmAdapter
+from .tools import PermissionMode
+from .web import HarnessService
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 
@@ -23,9 +22,27 @@ app = typer.Typer(no_args_is_help=True, add_completion=False)
 def headless(
     task: str = typer.Argument(..., help="One task to send to the agent."),
     model: str = typer.Option("deepseek-v4-flash", "--model", help="DeepSeek model id."),
-    cwd: Path = typer.Option(Path.cwd, "--cwd", help="Workspace directory."),
+    cwd: Path = typer.Option(Path.cwd(), "--cwd", help="Workspace directory."),
     session_root: Path | None = typer.Option(
         None, "--session-root", help="JSONL session directory."
+    ),
+    base_url: str | None = typer.Option(
+        None,
+        "--base-url",
+        envvar="DEEPSEEK_BASE_URL",
+        help="DeepSeek-compatible API base URL.",
+    ),
+    api_key: str | None = typer.Option(
+        None,
+        "--api-key",
+        envvar="DEEPSEEK_API_KEY",
+        help="API key; defaults to DEEPSEEK_API_KEY.",
+    ),
+    request_timeout_seconds: float = typer.Option(
+        120.0,
+        "--request-timeout",
+        min=1.0,
+        help="Provider request timeout in seconds.",
     ),
     max_tokens: int | None = typer.Option(None, "--max-tokens", min=1),
     permission_mode: PermissionMode = typer.Option(
@@ -43,6 +60,9 @@ def headless(
                 model=model,
                 cwd=cwd,
                 session_root=session_root,
+                base_url=base_url,
+                api_key=api_key,
+                request_timeout_seconds=request_timeout_seconds,
                 max_tokens=max_tokens,
                 permission_mode=permission_mode,
             )
@@ -66,7 +86,7 @@ def version() -> None:
 def serve(
     host: str = typer.Option("127.0.0.1", "--host", help="Bind address."),
     port: int = typer.Option(3080, "--port", min=1, max=65535, help="Bind port."),
-    cwd: Path = typer.Option(Path.cwd, "--cwd", help="Default workspace directory."),
+    cwd: Path = typer.Option(Path.cwd(), "--cwd", help="Default workspace directory."),
     session_root: Path | None = typer.Option(
         None, "--session-root", help="JSONL session directory."
     ),
@@ -74,6 +94,24 @@ def serve(
         None, "--web-dist", help="Built frontend directory to serve."
     ),
     model: str = typer.Option("deepseek-v4-flash", "--model", help="Default DeepSeek model."),
+    base_url: str | None = typer.Option(
+        None,
+        "--base-url",
+        envvar="DEEPSEEK_BASE_URL",
+        help="DeepSeek-compatible API base URL.",
+    ),
+    api_key: str | None = typer.Option(
+        None,
+        "--api-key",
+        envvar="DEEPSEEK_API_KEY",
+        help="API key; defaults to DEEPSEEK_API_KEY.",
+    ),
+    request_timeout_seconds: float = typer.Option(
+        120.0,
+        "--request-timeout",
+        min=1.0,
+        help="Provider request timeout in seconds.",
+    ),
     permission_mode: PermissionMode = typer.Option(
         PermissionMode.WORKSPACE_WRITE,
         "--permission-mode",
@@ -86,6 +124,13 @@ def serve(
 
     from .web import create_app
 
+    def configured_adapter(_selected_model: str) -> LlmAdapter:
+        return DeepSeekAdapter(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=request_timeout_seconds,
+        )
+
     uvicorn.run(
         create_app(
             session_root=session_root,
@@ -93,6 +138,7 @@ def serve(
             model=model,
             permission_mode=permission_mode,
             web_dist=web_dist,
+            adapter_factory=configured_adapter,
         ),
         host=host,
         port=port,
@@ -105,43 +151,48 @@ async def _run_headless(
     model: str,
     cwd: Path,
     session_root: Path | None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    request_timeout_seconds: float = 120.0,
     max_tokens: int | None,
     permission_mode: PermissionMode,
+    adapter_factory: Callable[[str], LlmAdapter] | None = None,
 ):
     workspace = cwd.expanduser().resolve()
     if not workspace.is_dir():
         raise HarnessError(f"workspace directory does not exist: {workspace}")
-    root = session_root or Path(
-        os.getenv("DSH_SESSION_ROOT", "~/.deepseek_harness_python/sessions")
-    )
-    store = JsonlSessionStore(root)
-    session = await store.create(f"session-{uuid.uuid4().hex}", cwd=str(workspace))
-    adapter = DeepSeekAdapter()
-    registry = ToolRegistry()
-    policy = WorkspacePolicy(workspace, permission_mode)
-    disposers = install_builtin_tools(
-        registry,
-        policy,
-        enable_shell=permission_mode is PermissionMode.DANGER_FULL_ACCESS,
-    )
-    agent = Agent(
-        session,
-        adapter,
-        tools=registry,
-        config=LlmCallConfig(model=model, max_tokens=max_tokens),
-        system_prompt=(
-            "You are a coding agent powered by the DeepSeek model. "
-            f"Your working directory is {workspace}."
-        ),
+    if request_timeout_seconds <= 0:
+        raise ValueError("request_timeout_seconds must be positive")
+
+    if adapter_factory is None:
+        def configured_adapter(_selected_model: str) -> LlmAdapter:
+            return DeepSeekAdapter(
+                api_key=api_key,
+                base_url=base_url,
+                timeout=request_timeout_seconds,
+            )
+
+        adapter_factory = configured_adapter
+    service = HarnessService(
+        session_root
+        or Path(os.getenv("DSH_SESSION_ROOT", "~/.deepseek_harness_python/sessions")),
+        cwd=workspace,
+        model=model,
+        permission_mode=permission_mode,
+        adapter_factory=adapter_factory,
     )
     try:
-        result = await agent.run(task)
-        await store.save(session)
+        if max_tokens is not None:
+            await service.settings.update("llm-deepseek", {"maxTokens": max_tokens})
+        handle = await service.create_session(
+            session_id=f"session-{uuid.uuid4().hex}",
+            cwd=str(workspace),
+        )
+        result = await handle.agent.run(task)
+        await service.store.save(handle.session)
         return result
     finally:
-        for dispose in reversed(disposers):
-            dispose()
-        await agent.dispose()
+        await service.dispose()
 
 
 def main() -> None:
