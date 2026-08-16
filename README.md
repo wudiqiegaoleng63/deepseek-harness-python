@@ -24,6 +24,9 @@ The native Python host now contains:
   and `list_agents` tools with parent/ancestor authorization and depth limits;
 - the event-sourced `todo_write` tool with whole-list replacement, validation,
   turn-scoped `todos` projections, and live mux updates;
+- the UI-backed `ask_user_question` tool and pending question response flow;
+- `messageFeedback/list|put|delete` with lifecycle fencing, compare-and-set
+  versions, note validation, and a durable JSON sidecar;
 - a constrained dynamic Cordis host runtime with package inventory, approvals,
   dynamic tools, and host/client RPCs;
 - the DSH HTTP RPC, WebSocket/SSE event carriers, settings, credentials, workspaces,

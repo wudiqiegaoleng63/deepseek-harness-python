@@ -25,6 +25,7 @@ from ..goals import GoalError, GoalManager
 from ..jobs import JobHandle, JobOutcome, JobRegistry
 from ..llm import DeepSeekAdapter, LlmCallConfig
 from ..llm.adapter import LlmAdapter
+from ..message_feedback import MessageFeedbackManager
 from ..models import ImageContent, Message, TextContent
 from ..session import JsonlSessionStore, Session, SessionEvent
 from ..settings import (
@@ -150,6 +151,7 @@ class HarnessService:
         self.presets = AgentPresetRegistry(state_root)
         self.goals = GoalManager()
         self.todos = TodoManager(allow_parallel_in_progress=True)
+        self.message_feedback = MessageFeedbackManager(state_root, max_note_bytes=8192)
         self.settings = SettingsRegistry(state_root)
         self.settings.register(
             "ui-onboarding",
@@ -1330,6 +1332,42 @@ class HarnessService:
             if handle.task is not None and not handle.task.done():
                 handle.task.cancel()
             return {"accepted": True}
+        if method == "messageFeedback/list":
+            handle = await self.get_session(self._required_string(payload, "sessionId"))
+            return await self.message_feedback.list(handle.session)
+        if method == "messageFeedback/put":
+            session_id = self._required_string(payload, "sessionId")
+            message_id = self._required_string(payload, "messageId")
+            rating = payload.get("rating")
+            if rating not in {"positive", "negative"}:
+                raise ApiFault("bad-request", "message feedback rating is invalid")
+            if "ifVersion" not in payload:
+                raise ApiFault("bad-request", "message feedback ifVersion is required")
+            if_version = payload.get("ifVersion")
+            if if_version is not None and not isinstance(if_version, str):
+                raise ApiFault("bad-request", "message feedback ifVersion must be a string or null")
+            note = payload.get("note")
+            if note is not None and not isinstance(note, str):
+                raise ApiFault("bad-request", "message feedback note must be a string")
+            handle = await self.get_session(session_id)
+            return await self.message_feedback.put(
+                handle.session,
+                message_id,
+                rating,
+                note,
+                if_version,
+            )
+        if method == "messageFeedback/delete":
+            session_id = self._required_string(payload, "sessionId")
+            message_id = self._required_string(payload, "messageId")
+            if not isinstance(payload.get("ifVersion"), str):
+                raise ApiFault("bad-request", "message feedback delete ifVersion must be a string")
+            handle = await self.get_session(session_id)
+            return await self.message_feedback.delete(
+                handle.session,
+                message_id,
+                payload["ifVersion"],
+            )
         if method == "dynamicCordisRunner/syncInspectManifest":
             self.dynamic.sync_inspect_manifest(payload.get("providers", []))
             return None
@@ -1619,6 +1657,136 @@ class HarnessService:
             self._publish_queue(handle)
             if handle.queue and not self._disposed:
                 handle.task = asyncio.create_task(self._run_queue(handle))
+
+    def _install_ask_user_tool(
+        self,
+        registry: ToolRegistry,
+        session: Session,
+    ) -> list[Callable[[], None]]:
+        """Install the UI-backed ``ask_user_question`` model tool."""
+
+        async def execute(args: dict[str, Any], context: ToolContext) -> ToolResult:
+            if context.session_id != session.id:
+                raise ApiFault(
+                    "subagent-unauthorized",
+                    "question tool context does not belong to the registered session",
+                    {"sessionId": context.session_id},
+                )
+            questions = self._normalize_questions(args.get("questions"))
+            answer = await self.request_question(session.id, questions)
+            return ToolResult(
+                json.dumps(answer, ensure_ascii=False, separators=(",", ":")),
+                meta=answer,
+            )
+
+        return [
+            registry.register(
+                ToolDefinition(
+                    name="ask_user_question",
+                    description=(
+                        "Ask the user a concise question when you need confirmation, a choice, "
+                        "or missing information before proceeding."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "questions": {
+                                "type": "array",
+                                "description": "Questions to ask the user before continuing.",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": True,
+                                    "properties": {
+                                        "id": {"type": "string"},
+                                        "question": {"type": "string"},
+                                        "header": {"type": "string"},
+                                        "options": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "additionalProperties": True,
+                                                "properties": {
+                                                    "label": {"type": "string"},
+                                                    "description": {"type": "string"},
+                                                },
+                                                "required": ["label"],
+                                            },
+                                        },
+                                        "multi_select": {"type": "boolean"},
+                                    },
+                                    "required": ["id", "question"],
+                                },
+                            }
+                        },
+                        "required": ["questions"],
+                        "additionalProperties": False,
+                    },
+                    execute=execute,
+                )
+            )
+        ]
+
+    @staticmethod
+    def _normalize_questions(raw: Any) -> list[JsonObject]:
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("questions must be a non-empty array")
+        normalized: list[JsonObject] = []
+        ids: set[str] = set()
+        for index, item in enumerate(raw):
+            if not isinstance(item, dict):
+                raise ValueError(f"question {index} must be an object")
+            question_id = item.get("id")
+            text = item.get("question")
+            if not isinstance(question_id, str) or not question_id.strip():
+                raise ValueError(f"question {index} id must be a non-empty string")
+            if question_id in ids:
+                raise ValueError(f"duplicate question id: {question_id}")
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError(f"question {question_id} must be a non-empty string")
+            ids.add(question_id)
+            value: JsonObject = {"id": question_id, "question": text}
+            for key in ("header",):
+                candidate = item.get(key)
+                if candidate is not None:
+                    if not isinstance(candidate, str):
+                        raise ValueError(f"question {question_id} {key} must be a string")
+                    value[key] = candidate
+            options = item.get("options")
+            if options is not None:
+                if not isinstance(options, list):
+                    raise ValueError(f"question {question_id} options must be an array")
+                normalized_options: list[JsonObject] = []
+                labels: set[str] = set()
+                for option_index, option in enumerate(options):
+                    if not isinstance(option, dict):
+                        raise ValueError(
+                            f"question {question_id} option {option_index} must be an object"
+                        )
+                    label = option.get("label")
+                    if not isinstance(label, str) or not label.strip():
+                        raise ValueError(
+                            f"question {question_id} option {option_index} label must be non-empty"
+                        )
+                    if label in labels:
+                        raise ValueError(f"duplicate option label: {label}")
+                    labels.add(label)
+                    normalized_option: JsonObject = {"label": label}
+                    description = option.get("description")
+                    if description is not None:
+                        if not isinstance(description, str):
+                            raise ValueError(
+                                f"question {question_id} option description must be a string"
+                            )
+                        normalized_option["description"] = description
+                    normalized_options.append(normalized_option)
+                value["options"] = normalized_options
+            multi_select = item.get("multi_select")
+            if multi_select is not None:
+                if not isinstance(multi_select, bool):
+                    raise ValueError(f"question {question_id} multi_select must be boolean")
+                value["multiSelect"] = multi_select
+            normalized.append(value)
+        return normalized
 
     def _install_todo_tool(
         self,
@@ -2330,6 +2498,7 @@ class HarnessService:
             self._tool_registries.pop(session.id, None)
 
         disposers.append(dispose_tool_registry)
+        disposers.extend(self._install_ask_user_tool(registry, session))
         disposers.extend(self._install_todo_tool(registry, session))
         disposers.extend(self._install_subagent_tools(registry, session))
         disposers.extend(install_dynamic_tools(registry, self.dynamic, session.id))
