@@ -10,7 +10,7 @@ import os
 import re
 import uuid
 import zipfile
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -56,6 +56,9 @@ AdapterFactory = Callable[[str], LlmAdapter]
 
 SUBAGENT_DESCRIPTOR_VERSION = 2
 MAX_SUBAGENT_DEPTH = 3
+DEFAULT_RALPH_MAX_ROUNDS = 256
+MAX_RALPH_HANDOFF_CHARS = 16_384
+MAX_RALPH_RESULT_CHARS = 16_384
 
 
 class ApiFault(HarnessError):
@@ -2057,6 +2060,316 @@ class HarnessService:
             )
         ]
 
+    def _install_ralph_tool(
+        self,
+        registry: ToolRegistry,
+        session: Session,
+    ) -> list[Callable[[], None]]:
+        """Install a foreground fresh-agent Ralph loop.
+
+        The TypeScript implementation expresses the fixed loop as a workflow
+        script.  Python keeps the same externally visible contract while
+        executing the loop natively: every round gets a blank one-shot child,
+        and only a bounded JSON handoff crosses the round boundary.
+        """
+
+        async def record(event_type: str, data: JsonObject) -> None:
+            event = session.append(event_type, data)
+            self._publish_event(session.id, event)
+            await self.store.save(session)
+
+        async def execute(args: dict[str, Any], context: ToolContext) -> ToolResult:
+            if context.session_id != session.id:
+                raise ApiFault(
+                    "subagent-unauthorized",
+                    "ralph tool context does not belong to the registered session",
+                    {"sessionId": context.session_id},
+                )
+            if session.header.parent_session:
+                raise ValueError(
+                    "Ralph requires a direct human turn on a top-level session"
+                )
+            if not self._goal_has_direct_human_turn(session):
+                raise ValueError(
+                    "Ralph requires a direct human turn on a top-level session"
+                )
+            objective = args.get("objective")
+            if not isinstance(objective, str) or not objective.strip():
+                raise ValueError("Ralph objective must be a non-empty string")
+            max_rounds = args.get("maxRounds", DEFAULT_RALPH_MAX_ROUNDS)
+            if isinstance(max_rounds, bool) or not isinstance(max_rounds, int) or max_rounds < 1:
+                raise ValueError("Ralph maxRounds must be a positive integer")
+            if max_rounds > DEFAULT_RALPH_MAX_ROUNDS:
+                raise ValueError(
+                    f"Ralph maxRounds {max_rounds} exceeds the deployment ceiling "
+                    f"{DEFAULT_RALPH_MAX_ROUNDS}"
+                )
+            run_id = f"ralph-{uuid.uuid4().hex}"
+            await record("tool-workflow/run-start", {"runId": run_id, "name": "ralph-loop"})
+            await record(
+                "tool-workflow/phase",
+                {"runId": run_id, "title": "Fresh-agent rounds"},
+            )
+            previous: JsonObject | None = None
+            stop_reason = "completed"
+            error: str | None = None
+            agents_started = 0
+            terminal: JsonObject | None = None
+            try:
+                for round_number in range(1, max_rounds + 1):
+                    prior = (
+                        "(none — this is the first round)"
+                        if previous is None
+                        else json.dumps(previous, ensure_ascii=False, separators=(",", ":"))
+                    )
+                    prompt = (
+                        "You are one fresh worker in a foreground Ralph loop. You receive no "
+                        "parent conversation and no prior child session. Do not call the ralph "
+                        "tool: this round already is its worker.\n\n"
+                        f"Immutable objective:\n{objective.strip()}\n\n"
+                        f"Ralph round: {round_number} of {max_rounds}.\n\n"
+                        "The shared workspace and its current working tree are long-term memory "
+                        "and the source of truth. Inspect it before acting, preserve existing "
+                        "work, perform concrete in-scope work, and verify what you change. "
+                        "Treat the previous report only as a bounded handoff and confirm it "
+                        "against the workspace.\n\n"
+                        f"Previous structured handoff:\n{prior}\n\n"
+                        "Return ONLY one JSON object with exactly these keys: status, summary, "
+                        "evidence, nextSteps, blocker. status is continue, complete, or blocked. "
+                        "Use continue with at least one nextSteps entry while useful work "
+                        "remains; use complete only with concrete evidence and no nextSteps; "
+                        "use blocked only when progress requires human input or external state. "
+                        "blocker must be empty unless blocked."
+                    )
+                    label = f"Ralph round {round_number}"
+
+                    async def announce(
+                        child_id: str,
+                        sequence: int = round_number,
+                        agent_label: str = label,
+                    ) -> None:
+                        await record(
+                            "tool-workflow/agent-start",
+                            {
+                                "runId": run_id,
+                                "seq": sequence,
+                                "label": agent_label,
+                                "phase": "Fresh-agent rounds",
+                                "childId": child_id,
+                            },
+                        )
+
+                    child_id, finish_reason, output = await self._run_fresh_subagent(
+                        await self.get_session(session.id),
+                        label,
+                        prompt,
+                        on_started=announce,
+                    )
+                    agents_started = round_number
+                    await record(
+                        "tool-workflow/agent-end",
+                        {
+                            "runId": run_id,
+                            "seq": round_number,
+                            "outcome": "completed"
+                            if finish_reason in {"completed", "max-tokens"}
+                            else "failed",
+                        },
+                    )
+                    if finish_reason not in {"completed", "max-tokens"}:
+                        stop_reason = "error"
+                        error = (
+                            f"Ralph round {round_number} child failed before producing a "
+                            "structured report."
+                        )
+                        rendered = (
+                            f"{error}\nNo previous handoff was available."
+                            if previous is None
+                            else f"{error}\nLast successful handoff:\n"
+                            f"{json.dumps(previous, ensure_ascii=False, indent=2)}"
+                        )
+                        return ToolResult(
+                            self._bound_ralph_result(rendered, MAX_RALPH_RESULT_CHARS),
+                            is_error=True,
+                            meta={
+                                "runId": run_id,
+                                "agentsStarted": agents_started,
+                                "status": "round-failed",
+                            },
+                        )
+                    try:
+                        report = self._parse_ralph_report(output)
+                    except ValueError as exc:
+                        stop_reason = "error"
+                        error = str(exc)
+                        rendered = (
+                            f"Ralph round {round_number} child failed before producing a "
+                            f"structured report: {exc}"
+                        )
+                        return ToolResult(
+                            self._bound_ralph_result(rendered, MAX_RALPH_RESULT_CHARS),
+                            is_error=True,
+                            meta={
+                                "runId": run_id,
+                                "agentsStarted": agents_started,
+                                "status": "round-failed",
+                            },
+                        )
+                    previous = report
+                    if report["status"] in {"complete", "blocked"}:
+                        terminal = {
+                            "status": report["status"],
+                            "roundsStarted": round_number,
+                            "report": report,
+                        }
+                        break
+                if terminal is None:
+                    assert previous is not None
+                    terminal = {
+                        "status": "budget-limited",
+                        "roundsStarted": max_rounds,
+                        "report": previous,
+                    }
+                rendered = self._render_ralph_result(terminal, MAX_RALPH_RESULT_CHARS)
+                return ToolResult(
+                    rendered,
+                    meta={
+                        "runId": run_id,
+                        "agentsStarted": agents_started,
+                        "result": terminal,
+                    },
+                )
+            except asyncio.CancelledError:
+                stop_reason = "cancelled"
+                error = "parent step aborted"
+                raise
+            except Exception as exc:
+                stop_reason = "error"
+                error = str(exc)
+                raise
+            finally:
+                await record(
+                    "tool-workflow/run-end",
+                    {
+                        "runId": run_id,
+                        "stopReason": stop_reason,
+                        **({"error": error} if error is not None else {}),
+                    },
+                )
+
+        return [
+            registry.register(
+                ToolDefinition(
+                    name="ralph",
+                    description=(
+                        "Run a foreground fresh-agent loop toward one immutable objective. "
+                        "Use only when the direct human explicitly asks for Ralph or fresh-agent "
+                        "iteration; each round starts a blank child and passes only a bounded "
+                        "structured handoff."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "objective": {
+                                "type": "string",
+                                "description": "The immutable completion objective.",
+                            },
+                            "maxRounds": {
+                                "type": "integer",
+                                "description": (
+                                    "Optional positive round cap, up to the deployment ceiling."
+                                ),
+                            },
+                        },
+                        "required": ["objective"],
+                        "additionalProperties": False,
+                    },
+                    execute=execute,
+                )
+            )
+        ]
+
+    @staticmethod
+    def _parse_ralph_report(output: str) -> JsonObject:
+        """Decode and enforce the fixed structured Ralph handoff."""
+
+        text = output.strip()
+        candidates = [text]
+        if text.startswith("```") and text.endswith("```"):
+            candidates.append(text.strip("`").removeprefix("json").strip())
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            candidates.append(text[start : end + 1])
+        value: Any = None
+        for candidate in candidates:
+            try:
+                value = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                break
+        if not isinstance(value, dict):
+            raise ValueError("Ralph child returned no structured round report")
+        if set(value) != {"status", "summary", "evidence", "nextSteps", "blocker"}:
+            raise ValueError("Ralph round report has unexpected fields")
+        status = value.get("status")
+        summary = value.get("summary")
+        evidence = value.get("evidence")
+        next_steps = value.get("nextSteps")
+        blocker = value.get("blocker")
+        if status not in {"continue", "complete", "blocked"}:
+            raise ValueError("Ralph round report status is invalid")
+        if not isinstance(summary, str) or not summary or summary != summary.strip():
+            raise ValueError("Ralph round report summary must be non-empty and normalized")
+        for name, items in (("evidence", evidence), ("nextSteps", next_steps)):
+            if not isinstance(items, list) or any(
+                not isinstance(item, str) or not item or item != item.strip() for item in items
+            ):
+                raise ValueError(
+                    f"Ralph round report {name} must contain normalized strings"
+                )
+        if not isinstance(blocker, str) or blocker != blocker.strip():
+            raise ValueError("Ralph round report blocker must be a normalized string")
+        if status == "continue" and (not next_steps or blocker != ""):
+            raise ValueError("a continuing Ralph report needs nextSteps and an empty blocker")
+        if status == "complete" and (not evidence or next_steps or blocker != ""):
+            raise ValueError(
+                "a complete Ralph report needs evidence, no nextSteps, and an empty blocker"
+            )
+        if status == "blocked" and not blocker:
+            raise ValueError("a blocked Ralph report needs a concrete blocker")
+        serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        if len(serialized) > MAX_RALPH_HANDOFF_CHARS:
+            raise ValueError("Ralph round report exceeds maxHandoffChars")
+        return value
+
+    @staticmethod
+    def _bound_ralph_result(text: str, maximum: int) -> str:
+        notice = "\n… [truncated]"
+        if len(text) <= maximum:
+            return text
+        if maximum <= len(notice):
+            return notice[:maximum]
+        return f"{text[: maximum - len(notice)]}{notice}"
+
+    @classmethod
+    def _render_ralph_result(cls, result: JsonObject, maximum: int) -> str:
+        status = result.get("status")
+        rounds = result.get("roundsStarted")
+        report = result.get("report")
+        noun = f"{rounds} round" + ("" if rounds == 1 else "s")
+        if status == "complete":
+            heading = f"Ralph worker reported completion after {noun}."
+        elif status == "blocked":
+            heading = f"Ralph worker reported a blocker after {noun}."
+        else:
+            heading = f"Ralph reached its {noun} limit; the worker reported work remaining."
+        return cls._bound_ralph_result(
+            f"{heading}\nFinal report:\n{json.dumps(report, ensure_ascii=False, indent=2)}",
+            maximum,
+        )
+
     @staticmethod
     def _goal_round_argument(args: dict[str, Any], name: str) -> int | None:
         value = args.get(name)
@@ -2651,6 +2964,42 @@ class HarnessService:
             },
         )
 
+    async def _run_fresh_subagent(
+        self,
+        parent: SessionHandle,
+        label: str,
+        prompt: str,
+        *,
+        on_started: Callable[[str], Awaitable[None]] | None = None,
+    ) -> tuple[str, str, str]:
+        """Run one blank one-shot child and expose its raw final text."""
+
+        child = await self._prepare_subagent(
+            parent,
+            label,
+            mode="one-shot",
+            inherit_context=False,
+        )
+        if on_started is not None:
+            await on_started(child.session.id)
+        task = asyncio.create_task(
+            child.agent.run(prompt),
+            name=f"dsh-ralph-{child.session.id}",
+        )
+        child.task = task
+        try:
+            result = await task
+        except asyncio.CancelledError:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+        finally:
+            if child.task is task:
+                child.task = None
+            await self.store.save(child.session)
+        return child.session.id, result.finish_reason or "completed", result.final_response.strip()
+
     async def _start_background_subagent(
         self,
         parent: SessionHandle,
@@ -2933,6 +3282,7 @@ class HarnessService:
         self._goal_activation.setdefault(session.id, "disarmed")
         disposers.extend(self._install_goal_tools(registry, session))
         disposers.extend(self._install_plan_tools(registry, session))
+        disposers.extend(self._install_ralph_tool(registry, session))
         disposers.extend(self._install_ask_user_tool(registry, session))
         disposers.extend(self._install_todo_tool(registry, session))
         disposers.extend(self._install_subagent_tools(registry, session))
