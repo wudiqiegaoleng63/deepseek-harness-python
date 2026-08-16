@@ -15,3 +15,11 @@ uv run dsh-python serve --web-dist frontend/dist
 
 `dist/` is generated and intentionally not committed. Set `DSH_WEB_DIST` when
 the server is started from another working directory.
+
+The build copies the browser roster into `boot.json`, rewrites the product
+title/manifest to **DeepSeek Harness Python**, and preserves the upstream
+plugin URLs. Run the host carrier smoke tests with:
+
+```sh
+uv run pytest -q tests/test_web.py
+```
