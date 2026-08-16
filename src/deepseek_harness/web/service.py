@@ -7,6 +7,7 @@ import base64
 import io
 import json
 import os
+import re
 import uuid
 import zipfile
 from collections.abc import AsyncIterator, Callable
@@ -27,6 +28,8 @@ from ..llm import DeepSeekAdapter, LlmCallConfig
 from ..llm.adapter import LlmAdapter
 from ..message_feedback import MessageFeedbackManager
 from ..models import ImageContent, Message, TextContent
+from ..plans import fold as fold_plan_mode
+from ..plans import has_open_turn
 from ..session import JsonlSessionStore, Session, SessionEvent
 from ..settings import (
     CredentialError,
@@ -235,6 +238,7 @@ class HarnessService:
         self._adapter_factory = adapter_factory or self._default_adapter
         self._handles: dict[str, SessionHandle] = {}
         self._tool_registries: dict[str, ToolRegistry] = {}
+        self._goal_activation: dict[str, Literal["armed", "disarmed"]] = {}
         self._mux_subscribers: set[asyncio.Queue[Frame]] = set()
         self._host_subscribers: set[asyncio.Queue[Frame]] = set()
         self.jobs = JobRegistry(on_changed=self._jobs_changed)
@@ -413,6 +417,9 @@ class HarnessService:
                 {"reason": "subagent"},
             )
         message = await self._build_message(content, client_time_zone=client_time_zone)
+        command_line = self._command_line(message)
+        if command_line is not None:
+            return await self._execute_command(handle, command_line)
         self._register_message_attachments(handle.session, message)
         item = QueueItem(message, "steering" if mode == "steer" else "queued")
         async with self._queue_lock:
@@ -431,6 +438,66 @@ class HarnessService:
         if task is not None and not task.done():
             task.cancel()
         return {"accepted": True}
+
+    @staticmethod
+    def _command_line(message: Message) -> str | None:
+        if len(message.content) != 1 or not isinstance(message.content[0], TextContent):
+            return None
+        text = message.content[0].text
+        return text if text.lstrip().startswith("/") else None
+
+    async def _execute_command(self, handle: SessionHandle, line: str) -> JsonObject:
+        """Execute the small host command surface needed by the shared UI."""
+
+        body = line.lstrip()[1:]
+        name, separator, raw_args = body.partition(" ")
+        if name != "plan":
+            raise ApiFault("unknown-command", f"unknown command: /{name}")
+        args = raw_args if separator else ""
+        target = args.strip() != "off"
+        command_id = f"cmd-{uuid.uuid4().hex}"
+        run = handle.session.append(
+            "command/run",
+            {
+                "commandId": command_id,
+                "name": "plan",
+                "args": args,
+                "source": {"kind": "user"},
+            },
+        )
+        self._publish_event(handle.session.id, run)
+        mode_event: SessionEvent | None = None
+        if not has_open_turn(handle.session) and fold_plan_mode(handle.session).active != target:
+            mode_event = handle.session.append("plan/mode", {"active": target})
+            self._publish_event(handle.session.id, mode_event)
+        if target:
+            text = (
+                "Entering plan mode (applies from the next step). Use /plan off to leave."
+                if mode_event is None
+                else "Plan mode on. Use /plan off to leave."
+            )
+        else:
+            text = (
+                "Leaving plan mode (applies from the next step)."
+                if mode_event is None
+                else "Plan mode off."
+            )
+        done_data: JsonObject = {
+            "commandId": command_id,
+            "kind": "success",
+            "text": text,
+        }
+        if mode_event is not None:
+            done_data["sourceEventSeq"] = mode_event.seq
+        done = handle.session.append("command/done", done_data)
+        self._publish_event(handle.session.id, done)
+        await self.store.save(handle.session)
+        if target and args.strip() and args.strip() != "off":
+            await self.prompt(
+                handle.session.id,
+                [{"type": "text", "text": args.strip()}],
+            )
+        return {"accepted": True, "command": {"kind": "success", "text": text}}
 
     async def request_approval(
         self,
@@ -767,6 +834,13 @@ class HarnessService:
                         "sessionId": session_id,
                         "key": "goal",
                         "value": self.goals.fold(handle.session).projection(),
+                        "seq": max(0, handle.session.seq - 1),
+                    }
+                    yield {
+                        "type": "session/projection",
+                        "sessionId": session_id,
+                        "key": "plan",
+                        "value": fold_plan_mode(handle.session).to_dict(),
                         "seq": max(0, handle.session.seq - 1),
                     }
                     yield {
@@ -1144,6 +1218,14 @@ class HarnessService:
             except CredentialError as exc:
                 raise ApiFault("credential-rejected", str(exc), {"ref": exc.ref}) from exc
             return {}
+        if method == "plan.set":
+            session_id = self._required_string(payload, "sessionId")
+            active = payload.get("active")
+            if not isinstance(active, bool):
+                raise ApiFault("bad-request", "plan.set active must be a boolean")
+            handle = await self.get_session(session_id)
+            await self._execute_command(handle, "/plan" if active else "/plan off")
+            return {"plan": fold_plan_mode(handle.session).to_dict()}
         if method.startswith("goal."):
             session_id = self._required_string(payload, "sessionId")
             handle = await self.get_session(session_id)
@@ -1161,6 +1243,7 @@ class HarnessService:
                         objective,
                         self._optional_payload_int(payload, "maxGoalRounds", positive=True),
                     )
+                    self._goal_activation[session_id] = "armed"
                 else:
                     ref = payload.get("ref")
                     if not isinstance(ref, dict):
@@ -1191,8 +1274,12 @@ class HarnessService:
                             cast(Literal["pause", "resume", "complete"], operation),
                             ref,
                         )
+                        self._goal_activation[session_id] = (
+                            "armed" if operation == "resume" else "disarmed"
+                        )
                     elif method == "goal.clear":
                         self.goals.clear(handle.session, ref)
+                        self._goal_activation[session_id] = "disarmed"
                         await self.store.save(handle.session)
                         event = handle.session.events[-1]
                         self._publish_event(session_id, event)
@@ -1658,6 +1745,344 @@ class HarnessService:
             if handle.queue and not self._disposed:
                 handle.task = asyncio.create_task(self._run_queue(handle))
 
+    def _install_goal_tools(
+        self,
+        registry: ToolRegistry,
+        session: Session,
+    ) -> list[Callable[[], None]]:
+        """Install the TS-compatible model-facing goal tool trio."""
+
+        def require_context(context: ToolContext, *, mutation: bool = False) -> None:
+            if context.session_id != session.id:
+                raise ApiFault(
+                    "subagent-unauthorized",
+                    "goal tool context does not belong to the registered session",
+                    {"sessionId": context.session_id},
+                )
+            if mutation and session.header.parent_session:
+                raise ValueError(
+                    "goal mutations require a direct human turn on a top-level session"
+                )
+
+        def require_direct_human_turn() -> None:
+            if not self._goal_has_direct_human_turn(session):
+                raise ValueError(
+                    "goal mutations require a direct human turn on a top-level session"
+                )
+
+        async def commit() -> None:
+            await self.store.save(session)
+            event = session.events[-1]
+            self._publish_event(session.id, event)
+            handle = self._handles.get(session.id)
+            if handle is not None:
+                self._publish_goal_projection(handle)
+
+        def value() -> JsonObject:
+            view = self.goals.view(
+                session,
+                activation=self._goal_activation.get(session.id, "disarmed"),
+            )
+            if view is None:
+                return {"goal": None}
+            goal = {
+                key: view[key]
+                for key in (
+                    "id",
+                    "revision",
+                    "objective",
+                    "phase",
+                    "roundsStarted",
+                    "maxGoalRounds",
+                    "blockedReason",
+                )
+                if key in view
+            }
+            return {"goal": goal, "activation": view["activation"]}
+
+        async def get_goal(args: dict[str, Any], context: ToolContext) -> ToolResult:
+            require_context(context)
+            result = value()
+            return ToolResult(
+                json.dumps(result, ensure_ascii=False, separators=(",", ":")),
+                meta=result,
+            )
+
+        async def create_goal(args: dict[str, Any], context: ToolContext) -> ToolResult:
+            require_context(context, mutation=True)
+            require_direct_human_turn()
+            objective = args.get("objective")
+            if not isinstance(objective, str):
+                raise ValueError("objective must be a string")
+            max_rounds = self._goal_round_argument(args, "max_goal_rounds")
+            self.goals.create(session, objective, max_rounds)
+            self._goal_activation[session.id] = "armed"
+            await commit()
+            result = value()
+            return ToolResult(
+                json.dumps(result, ensure_ascii=False, separators=(",", ":")),
+                meta=result,
+            )
+
+        async def update_goal(args: dict[str, Any], context: ToolContext) -> ToolResult:
+            require_context(context, mutation=True)
+            require_direct_human_turn()
+            goal_id = args.get("goal_id")
+            revision = args.get("revision")
+            action = args.get("action")
+            if (
+                not isinstance(goal_id, str)
+                or not goal_id.strip()
+                or goal_id != goal_id.strip()
+            ):
+                raise ValueError("goal_id must be a non-empty normalized string")
+            if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+                raise ValueError("revision must be a positive integer")
+            if action not in {"edit", "pause", "resume", "complete", "blocked"}:
+                raise ValueError("action must be edit, pause, resume, complete, or blocked")
+            objective = args.get("objective")
+            if objective is not None and not isinstance(objective, str):
+                raise ValueError("objective must be a string")
+            max_rounds = self._goal_round_argument(args, "max_goal_rounds")
+            blocked_reason = args.get("blocked_reason")
+            if blocked_reason is not None and not isinstance(blocked_reason, str):
+                raise ValueError("blocked_reason must be a string")
+            ref = {"id": goal_id, "revision": revision}
+            if action == "edit":
+                if objective is None and max_rounds is None:
+                    raise ValueError("edit requires objective or max_goal_rounds")
+                if blocked_reason not in (None, ""):
+                    raise ValueError("blocked_reason is valid only with action blocked")
+                self.goals.edit(session, ref, objective, max_rounds)
+            elif action in {"pause", "resume", "complete"}:
+                if (
+                    (isinstance(objective, str) and objective.strip())
+                    or max_rounds is not None
+                    or blocked_reason not in (None, "")
+                ):
+                    raise ValueError(
+                        "objective and max_goal_rounds are valid only with action edit; "
+                        "blocked_reason is valid only with action blocked"
+                    )
+                self.goals.transition(session, action, ref)
+                self._goal_activation[session.id] = (
+                    "armed" if action == "resume" else "disarmed"
+                )
+            else:
+                if (
+                    (isinstance(objective, str) and objective.strip())
+                    or max_rounds is not None
+                ):
+                    raise ValueError(
+                        "objective and max_goal_rounds are valid only with action edit"
+                    )
+                if not isinstance(blocked_reason, str) or not blocked_reason.strip():
+                    raise ValueError("blocked_reason is required with action blocked")
+                self.goals.block(
+                    session,
+                    ref,
+                    {"code": "model-reported", "message": blocked_reason},
+                )
+                self._goal_activation[session.id] = "disarmed"
+            await commit()
+            result = value()
+            return ToolResult(
+                json.dumps(result, ensure_ascii=False, separators=(",", ":")),
+                meta=result,
+            )
+
+        definitions = [
+            ToolDefinition(
+                name="get_goal",
+                description=(
+                    "Read the current same-session completion goal, including its exact id, "
+                    "revision, objective, phase, rounds, and activation. Call this before updating."
+                ),
+                parameters={"type": "object", "properties": {}, "additionalProperties": False},
+                execute=get_goal,
+            ),
+            ToolDefinition(
+                name="create_goal",
+                description=(
+                    "Create one persisted same-session completion goal for a long-running direct "
+                    "human request. Do not use this for routine single-turn work."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "objective": {
+                            "type": "string",
+                            "description": "The concrete completion objective.",
+                        },
+                        "max_goal_rounds": {
+                            "type": "integer",
+                            "description": "Optional positive limit on continuation rounds.",
+                        },
+                    },
+                    "required": ["objective"],
+                    "additionalProperties": False,
+                },
+                execute=create_goal,
+            ),
+            ToolDefinition(
+                name="update_goal",
+                description=(
+                    "Update the exact current goal revision. Use edit, pause, resume, complete, "
+                    "or blocked; copy goal_id and revision from get_goal."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "goal_id": {"type": "string"},
+                        "revision": {"type": "integer"},
+                        "action": {
+                            "type": "string",
+                            "enum": ["edit", "pause", "resume", "complete", "blocked"],
+                        },
+                        "objective": {"type": "string"},
+                        "max_goal_rounds": {"type": "integer"},
+                        "blocked_reason": {"type": "string"},
+                    },
+                    "required": ["goal_id", "revision", "action"],
+                    "additionalProperties": False,
+                },
+                execute=update_goal,
+            ),
+        ]
+        return [registry.register(definition) for definition in definitions]
+
+    def _install_plan_tools(
+        self,
+        registry: ToolRegistry,
+        session: Session,
+    ) -> list[Callable[[], None]]:
+        """Install the stable plan-review exit tool."""
+
+        async def exit_plan_mode(args: dict[str, Any], context: ToolContext) -> ToolResult:
+            if context.session_id != session.id:
+                raise ApiFault(
+                    "subagent-unauthorized",
+                    "plan tool context does not belong to the registered session",
+                    {"sessionId": context.session_id},
+                )
+            if not fold_plan_mode(session).active:
+                raise ValueError("exit_plan_mode is only available in plan mode")
+            plan = args.get("plan")
+            if not isinstance(plan, str) or re.match(r"^#\s+\S", plan.strip()) is None:
+                raise ValueError(
+                    "exit_plan_mode requires a non-empty markdown plan starting with a # heading"
+                )
+            if session.header.parent_session:
+                raise ValueError(
+                    "human interaction is unavailable while the calling agent is owned by "
+                    "another live agent; include the unresolved question or decision in the "
+                    "child agent's final result"
+                )
+            answer = await self.request_question(
+                session.id,
+                [
+                    {
+                        "id": "plan-review",
+                        "header": "Plan review",
+                        "question": "Approve this plan and leave plan mode?",
+                        "detail": plan,
+                        "options": [
+                            {
+                                "label": "Approve",
+                                "description": (
+                                    "Leave plan mode; carry out the plan from the next step."
+                                ),
+                            },
+                            {
+                                "label": "Keep planning",
+                                "description": (
+                                    "Stay in plan mode; feedback goes back to the model."
+                                ),
+                            },
+                        ],
+                        "intent": {"kind": "plan-review", "approve": "Approve"},
+                    }
+                ],
+            )
+            answers = answer.get("answers")
+            item = next(
+                (
+                    entry
+                    for entry in answers
+                    if isinstance(entry, dict) and entry.get("id") == "plan-review"
+                ),
+                None,
+            ) if isinstance(answers, list) else None
+            selected = item.get("selected") if isinstance(item, dict) else None
+            custom = item.get("custom") if isinstance(item, dict) else None
+            if selected != ["Approve"] or custom is not None:
+                feedback = custom if isinstance(custom, str) else ""
+                raise ValueError(
+                    "The user chose to keep planning; revise the plan and present it again."
+                    if not feedback
+                    else f"The user chose to keep planning; their feedback: {feedback}"
+                )
+            event = session.append("plan/mode", {"active": False})
+            await self.store.save(session)
+            self._publish_event(session.id, event)
+            return ToolResult(
+                "Plan approved — plan mode exited; carry out the plan starting with your "
+                "next step.",
+                meta={"approved": True},
+            )
+
+        return [
+            registry.register(
+                ToolDefinition(
+                    name="exit_plan_mode",
+                    description=(
+                        "Use only in plan mode. Present the COMPLETE plan as markdown starting "
+                        "with a # heading for user review; the user may approve or keep planning."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "plan": {
+                                "type": "string",
+                                "description": (
+                                    "The complete plan as markdown, starting with a # heading."
+                                ),
+                            }
+                        },
+                        "required": ["plan"],
+                        "additionalProperties": False,
+                    },
+                    execute=exit_plan_mode,
+                )
+            )
+        ]
+
+    @staticmethod
+    def _goal_round_argument(args: dict[str, Any], name: str) -> int | None:
+        value = args.get(name)
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+        return value
+
+    @staticmethod
+    def _goal_has_direct_human_turn(session: Session) -> bool:
+        if session.header.parent_session:
+            return False
+        open_turn = False
+        for event in session.events:
+            if event.type == "turn/start":
+                open_turn = True
+            elif event.type == "turn/end":
+                open_turn = False
+            elif open_turn and event.type == "user/message":
+                message = event.data.get("message")
+                source = message.get("source") if isinstance(message, dict) else None
+                if isinstance(source, dict) and source.get("kind") == "user":
+                    return True
+        return False
+
     def _install_ask_user_tool(
         self,
         registry: ToolRegistry,
@@ -1700,6 +2125,8 @@ class HarnessService:
                                         "id": {"type": "string"},
                                         "question": {"type": "string"},
                                         "header": {"type": "string"},
+                                        "detail": {"type": "string"},
+                                        "intent": {"type": "object"},
                                         "options": {
                                             "type": "array",
                                             "items": {
@@ -1745,12 +2172,17 @@ class HarnessService:
                 raise ValueError(f"question {question_id} must be a non-empty string")
             ids.add(question_id)
             value: JsonObject = {"id": question_id, "question": text}
-            for key in ("header",):
+            for key in ("header", "detail"):
                 candidate = item.get(key)
                 if candidate is not None:
                     if not isinstance(candidate, str):
                         raise ValueError(f"question {question_id} {key} must be a string")
                     value[key] = candidate
+            intent = item.get("intent")
+            if intent is not None:
+                if not isinstance(intent, dict):
+                    raise ValueError(f"question {question_id} intent must be an object")
+                value["intent"] = dict(intent)
             options = item.get("options")
             if options is not None:
                 if not isinstance(options, list):
@@ -2498,6 +2930,9 @@ class HarnessService:
             self._tool_registries.pop(session.id, None)
 
         disposers.append(dispose_tool_registry)
+        self._goal_activation.setdefault(session.id, "disarmed")
+        disposers.extend(self._install_goal_tools(registry, session))
+        disposers.extend(self._install_plan_tools(registry, session))
         disposers.extend(self._install_ask_user_tool(registry, session))
         disposers.extend(self._install_todo_tool(registry, session))
         disposers.extend(self._install_subagent_tools(registry, session))
@@ -2518,6 +2953,26 @@ class HarnessService:
             if configured_effort in {"off", "high", "max"}
             else None
         )
+        base_system_prompt = (
+            "You are a coding agent powered by the DeepSeek model. "
+            f"Your working directory is {workspace}."
+            + (
+                f" Your agent preset is {session.header.agent_preset}."
+                if session.header.agent_preset
+                else ""
+            )
+        )
+
+        def system_prompt() -> str:
+            if not fold_plan_mode(session).active:
+                return base_system_prompt
+            return base_system_prompt + (
+                "\n\nPlan mode is active. Explore the workspace and reason about the "
+                "implementation "
+                "before changing files. Present the complete plan with exit_plan_mode for user "
+                "review; if the user keeps planning, revise the plan and present it again."
+            )
+
         agent = Agent(
             session,
             self._adapter_factory(model_name),
@@ -2529,15 +2984,7 @@ class HarnessService:
                 thinking=thinking,
                 reasoning_effort=reasoning_effort,
             ),
-            system_prompt=(
-                "You are a coding agent powered by the DeepSeek model. "
-                f"Your working directory is {workspace}."
-                + (
-                    f" Your agent preset is {session.header.agent_preset}."
-                    if session.header.agent_preset
-                    else ""
-                )
-            ),
+            system_prompt=system_prompt,
         )
         handle = SessionHandle(session, agent, disposers)
         agent.subscribe(lambda event: self._publish_event(session.id, event))
@@ -2567,10 +3014,18 @@ class HarnessService:
         self._publish_mux(
             {"type": "session/event", "sessionId": session_id, "event": event.to_dict()}
         )
+        handle = self._handles.get(session_id)
+        if handle is None:
+            return
         if event.type in {"todo/write", "turn/start"}:
-            handle = self._handles.get(session_id)
-            if handle is not None:
-                self._publish_todo_projection(handle)
+            self._publish_todo_projection(handle)
+        if event.type in {"plan/mode", "command/run", "turn/start"}:
+            self._publish_plan_projection(handle)
+        if event.type == "turn/start":
+            state = fold_plan_mode(handle.session)
+            if state.pending and state.wanted is not None:
+                mode_event = handle.session.append("plan/mode", {"active": state.wanted})
+                self._publish_event(session_id, mode_event)
 
     def _publish_mux(self, frame: Frame) -> None:
         for queue in tuple(self._mux_subscribers):
@@ -2621,6 +3076,17 @@ class HarnessService:
             }
         )
 
+    def _publish_plan_projection(self, handle: SessionHandle) -> None:
+        self._publish_mux(
+            {
+                "type": "session/projection",
+                "sessionId": handle.session.id,
+                "key": "plan",
+                "value": fold_plan_mode(handle.session).to_dict(),
+                "seq": handle.session.seq - 1,
+            }
+        )
+
     def _publish_todo_projection(self, handle: SessionHandle) -> None:
         self._publish_mux(
             {
@@ -2635,6 +3101,7 @@ class HarnessService:
     def _projection_values(self, session: Session) -> JsonObject:
         return {
             "goal": self.goals.fold(session).projection(),
+            "plan": fold_plan_mode(session).to_dict(),
             "todos": self.todos.fold(session),
             "imageLimits": self._image_limits(),
         }

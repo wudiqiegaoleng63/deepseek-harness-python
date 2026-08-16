@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -104,6 +105,34 @@ class GoalManager:
             last_ref = {"id": goal.id, "revision": goal.revision}
         return GoalFold(goal, rounds_started, created_at, updated_at, last_ref)
 
+    def view(
+        self,
+        session: Session,
+        *,
+        activation: Literal["armed", "disarmed"] = "disarmed",
+    ) -> dict[str, JsonValue] | None:
+        """Return the model-facing live view for the current goal.
+
+        ``activation`` is deliberately supplied by the host.  It is process
+        local and must never be written into the durable ``goal/change``
+        payload, matching the TypeScript goal service's separation between
+        replay state and continuation authority.
+        """
+
+        projection = self.fold(session).projection()
+        if projection is None:
+            return None
+        raw_goal = projection.get("goal")
+        if not isinstance(raw_goal, dict):
+            return None
+        view = dict(raw_goal)
+        for key in ("roundsStarted", "createdAt", "updatedAt"):
+            value = projection.get(key)
+            if value is not None:
+                view[key] = value
+        view["activation"] = activation
+        return view
+
     def create(
         self, session: Session, objective: str, max_goal_rounds: int | None
     ) -> dict[str, JsonValue]:
@@ -190,6 +219,52 @@ class GoalManager:
         self._append_snapshot(
             session,
             operation,
+            goal,
+            folded.rounds_started,
+            folded.created_at or now_millis(),
+            self._next_time(folded),
+        )
+        return {"id": goal.id, "revision": goal.revision}
+
+    def block(
+        self,
+        session: Session,
+        ref: dict[str, Any],
+        reason: dict[str, Any],
+    ) -> dict[str, JsonValue]:
+        """Mark an active goal blocked with a durable policy explanation."""
+
+        folded = self._expect(session, ref)
+        current = folded.goal
+        assert current is not None
+        if current.phase != "active":
+            raise GoalError(
+                f'cannot block goal "{current.id}" from phase "{current.phase}"',
+                "GOAL_INVALID_TRANSITION",
+            )
+        code = reason.get("code")
+        message = reason.get("message")
+        if (
+            not isinstance(code, str)
+            or re.fullmatch(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", code) is None
+            or not isinstance(message, str)
+            or not message.strip()
+        ):
+            raise GoalError(
+                "goal block reason requires a lower-kebab-case code and a non-empty message",
+                "GOAL_INVALID_BLOCK_REASON",
+            )
+        goal = GoalSnapshot(
+            current.id,
+            current.revision + 1,
+            current.objective,
+            "blocked",
+            current.max_goal_rounds,
+            {"code": code, "message": message.strip()},
+        )
+        self._append_snapshot(
+            session,
+            "block",
             goal,
             folded.rounds_started,
             folded.created_at or now_millis(),

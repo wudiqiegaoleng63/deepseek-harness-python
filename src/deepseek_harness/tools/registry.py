@@ -87,4 +87,9 @@ class ToolRegistry:
                 raise TypeError("tool executor must return ToolResult")
             return result
         except Exception as exc:
-            return ToolResult(f"{type(exc).__name__}: {exc}", is_error=True)
+            code = getattr(exc, "code", None)
+            return ToolResult(
+                f"{type(exc).__name__}: {exc}",
+                is_error=True,
+                meta={"code": code} if isinstance(code, str) else None,
+            )

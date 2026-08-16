@@ -24,6 +24,10 @@ The native Python host now contains:
   and `list_agents` tools with parent/ancestor authorization and depth limits;
 - the event-sourced `todo_write` tool with whole-list replacement, validation,
   turn-scoped `todos` projections, and live mux updates;
+- model-facing `get_goal`, `create_goal`, and CAS-guarded `update_goal` tools,
+  including blocked reasons and process-local activation;
+- event-sourced plan mode with `/plan`, the `plan` projection, dynamic plan
+  guidance, and `exit_plan_mode` user review;
 - the UI-backed `ask_user_question` tool and pending question response flow;
 - `messageFeedback/list|put|delete` with lifecycle fencing, compare-and-set
   versions, note validation, and a durable JSON sidecar;

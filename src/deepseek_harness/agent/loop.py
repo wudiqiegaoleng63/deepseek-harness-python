@@ -51,7 +51,7 @@ class Agent:
         *,
         tools: ToolRegistry | None = None,
         config: LlmCallConfig | None = None,
-        system_prompt: str | None = None,
+        system_prompt: str | Callable[[], str] | None = None,
         max_steps: int = 64,
     ) -> None:
         self.session = session
@@ -130,7 +130,11 @@ class Agent:
                 request = LlmRequest(
                     messages=self.session.derive_messages(),
                     config=self.config,
-                    system=self.system_prompt,
+                    system=(
+                        self.system_prompt()
+                        if callable(self.system_prompt)
+                        else self.system_prompt
+                    ),
                     tools=self.tools.schemas(),
                 )
                 try:
