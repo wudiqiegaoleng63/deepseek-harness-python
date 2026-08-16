@@ -41,7 +41,9 @@ The native Python host now contains:
 - the DSH HTTP RPC, WebSocket/SSE event carriers, settings, credentials, workspaces,
   goals, presets, skills, attachments, and session ZIP export;
 - the original React/TypeScript frontend served with the Python host;
-- a native synchronous `DeepSeekHarness` SDK for embedding the runtime.
+- a native synchronous `DeepSeekHarness` SDK for embedding the runtime;
+- a stdio JSON-RPC SDK server and `DeepSeekHarnessProcess` client for
+  cross-language and multi-process embedding.
 
 Install the development project with `uv`:
 
@@ -73,6 +75,30 @@ with DeepSeekHarness(
 
 print(result.final_response)
 ```
+
+For an isolated child process, use the compatible SDK runtime over newline-
+delimited JSON-RPC. The low-level protocol supports `initialize`,
+`session/prompt`, and `shutdown`, plus `session.event`, `session.status`, and
+subagent lifecycle notifications:
+
+```python
+from deepseek_harness import DeepSeekHarnessProcess
+
+with DeepSeekHarnessProcess(cwd="/path/to/workspace") as harness:
+    result = harness.run("Inspect the repository and summarize it.")
+
+print(result.final_response)
+```
+
+The server can also be launched directly for a non-Python host:
+
+```sh
+uv run dsh-python sdk-server
+```
+
+It reads and writes one JSON-RPC object per line on stdin/stdout. Configure
+the provider with `--api-key`, `--base-url`, and `--request-timeout`, or use
+the matching `DEEPSEEK_API_KEY` and `DEEPSEEK_BASE_URL` environment variables.
 
 Shell execution is deliberately disabled in `workspace-write` mode until the
 platform sandbox provider is implemented. It can only be explicitly enabled

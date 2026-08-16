@@ -82,6 +82,47 @@ def version() -> None:
     typer.echo("DeepSeek Harness Python 0.1.0.dev0")
 
 
+@app.command("sdk-server")
+def sdk_server(
+    session_root: Path | None = typer.Option(
+        None, "--session-root", help="JSONL session directory."
+    ),
+    base_url: str | None = typer.Option(
+        None,
+        "--base-url",
+        envvar="DEEPSEEK_BASE_URL",
+        help="DeepSeek-compatible API base URL.",
+    ),
+    api_key: str | None = typer.Option(
+        None,
+        "--api-key",
+        envvar="DEEPSEEK_API_KEY",
+        help="API key; defaults to DEEPSEEK_API_KEY.",
+    ),
+    request_timeout_seconds: float = typer.Option(
+        120.0,
+        "--request-timeout",
+        min=1.0,
+        help="Provider request timeout in seconds.",
+    ),
+) -> None:
+    """Run the newline-delimited JSON-RPC SDK runtime on stdio."""
+
+    from .sdk_rpc import run_sdk_server
+
+    try:
+        asyncio.run(
+            run_sdk_server(
+                session_root=session_root,
+                api_key=api_key,
+                base_url=base_url,
+                timeout=request_timeout_seconds,
+            )
+        )
+    except KeyboardInterrupt as exc:
+        raise typer.Exit(code=130) from exc
+
+
 @app.command("serve")
 def serve(
     host: str = typer.Option("127.0.0.1", "--host", help="Bind address."),

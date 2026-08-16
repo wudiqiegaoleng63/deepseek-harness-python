@@ -10,6 +10,14 @@ from .llm import DeepSeekAdapter, LlmAdapter, LlmCallConfig, LlmRequest, StreamC
 from .models import Message, TextContent, ToolCallContent, ToolResultContent
 from .sdk import DeepSeekHarness, DeepSeekHarnessConfig
 from .sdk import RunResult as SdkRunResult
+from .sdk_process import (
+    DeepSeekHarnessProcess,
+    HarnessClient,
+    JsonRpcResponseError,
+    NotificationSubscription,
+    ProcessRunResult,
+    ProcessSession,
+)
 from .session import JsonlSessionStore, Session, SessionEvent, SessionHeader
 
 __all__ = [
@@ -18,11 +26,17 @@ __all__ = [
     "DeepSeekAdapter",
     "DeepSeekHarness",
     "DeepSeekHarnessConfig",
+    "DeepSeekHarnessProcess",
+    "HarnessClient",
+    "JsonRpcResponseError",
     "JsonlSessionStore",
     "LlmAdapter",
     "LlmCallConfig",
     "LlmRequest",
     "Message",
+    "NotificationSubscription",
+    "ProcessSession",
+    "ProcessRunResult",
     "RunResult",
     "SdkRunResult",
     "Session",
