@@ -35,6 +35,7 @@ from ..settings import (
     SettingsRegistry,
 )
 from ..skills import SkillRegistry
+from ..todos import TodoError, TodoManager
 from ..tools import PermissionMode, WorkspacePolicy, install_builtin_tools
 from ..tools.registry import ToolContext, ToolDefinition, ToolRegistry, ToolResult
 from ..workspace import (
@@ -148,6 +149,7 @@ class HarnessService:
         self.attachments = AttachmentStore(state_root)
         self.presets = AgentPresetRegistry(state_root)
         self.goals = GoalManager()
+        self.todos = TodoManager(allow_parallel_in_progress=True)
         self.settings = SettingsRegistry(state_root)
         self.settings.register(
             "ui-onboarding",
@@ -763,6 +765,13 @@ class HarnessService:
                         "sessionId": session_id,
                         "key": "goal",
                         "value": self.goals.fold(handle.session).projection(),
+                        "seq": max(0, handle.session.seq - 1),
+                    }
+                    yield {
+                        "type": "session/projection",
+                        "sessionId": session_id,
+                        "key": "todos",
+                        "value": self.todos.fold(handle.session),
                         "seq": max(0, handle.session.seq - 1),
                     }
                     yield {
@@ -1611,6 +1620,76 @@ class HarnessService:
             if handle.queue and not self._disposed:
                 handle.task = asyncio.create_task(self._run_queue(handle))
 
+    def _install_todo_tool(
+        self,
+        registry: ToolRegistry,
+        session: Session,
+    ) -> list[Callable[[], None]]:
+        """Install the canonical whole-list ``todo_write`` model tool."""
+
+        async def execute(args: dict[str, Any], context: ToolContext) -> ToolResult:
+            if context.session_id != session.id:
+                raise ApiFault(
+                    "subagent-unauthorized",
+                    "todo tool context does not belong to the registered session",
+                    {"sessionId": context.session_id},
+                )
+            try:
+                write = self.todos.write(session, args.get("todos"))
+            except TodoError as exc:
+                raise ValueError(str(exc)) from exc
+            await self.store.save(session)
+            self._publish_event(session.id, write.event)
+            value = write.value()
+            counts = value["counts"]
+            assert isinstance(counts, dict)
+            return ToolResult(
+                "Updated todo list: "
+                f"{counts['pending']} pending, "
+                f"{counts['inProgress']} in progress, "
+                f"{counts['completed']} completed.",
+                meta=value,
+            )
+
+        return [
+            registry.register(
+                ToolDefinition(
+                    name="todo_write",
+                    description=(
+                        "Record and replace the complete structured task list for the current "
+                        "work. Use pending, in_progress, or completed; send the entire list "
+                        "every call."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "todos": {
+                                "type": "array",
+                                "description": (
+                                    "The complete task list replacing the previous list."
+                                ),
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "content": {"type": "string"},
+                                        "status": {
+                                            "type": "string",
+                                            "enum": ["pending", "in_progress", "completed"],
+                                        },
+                                    },
+                                    "required": ["content", "status"],
+                                    "additionalProperties": False,
+                                },
+                            }
+                        },
+                        "required": ["todos"],
+                        "additionalProperties": False,
+                    },
+                    execute=execute,
+                )
+            )
+        ]
+
     def _install_subagent_tools(
         self,
         registry: ToolRegistry,
@@ -2251,6 +2330,7 @@ class HarnessService:
             self._tool_registries.pop(session.id, None)
 
         disposers.append(dispose_tool_registry)
+        disposers.extend(self._install_todo_tool(registry, session))
         disposers.extend(self._install_subagent_tools(registry, session))
         disposers.extend(install_dynamic_tools(registry, self.dynamic, session.id))
         selection = session.header.model_selection or self._default_selection()
@@ -2318,6 +2398,10 @@ class HarnessService:
         self._publish_mux(
             {"type": "session/event", "sessionId": session_id, "event": event.to_dict()}
         )
+        if event.type in {"todo/write", "turn/start"}:
+            handle = self._handles.get(session_id)
+            if handle is not None:
+                self._publish_todo_projection(handle)
 
     def _publish_mux(self, frame: Frame) -> None:
         for queue in tuple(self._mux_subscribers):
@@ -2368,9 +2452,21 @@ class HarnessService:
             }
         )
 
+    def _publish_todo_projection(self, handle: SessionHandle) -> None:
+        self._publish_mux(
+            {
+                "type": "session/projection",
+                "sessionId": handle.session.id,
+                "key": "todos",
+                "value": self.todos.fold(handle.session),
+                "seq": handle.session.seq - 1,
+            }
+        )
+
     def _projection_values(self, session: Session) -> JsonObject:
         return {
             "goal": self.goals.fold(session).projection(),
+            "todos": self.todos.fold(session),
             "imageLimits": self._image_limits(),
         }
 

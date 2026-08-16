@@ -22,6 +22,8 @@ The native Python host now contains:
   `str_replace_editor` tools, plus optional shell and background jobs;
 - model-facing `subagent`, `subagent_fork`, `send_message`, `interrupt_agent`,
   and `list_agents` tools with parent/ancestor authorization and depth limits;
+- the event-sourced `todo_write` tool with whole-list replacement, validation,
+  turn-scoped `todos` projections, and live mux updates;
 - a constrained dynamic Cordis host runtime with package inventory, approvals,
   dynamic tools, and host/client RPCs;
 - the DSH HTTP RPC, WebSocket/SSE event carriers, settings, credentials, workspaces,
