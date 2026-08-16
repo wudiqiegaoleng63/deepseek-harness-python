@@ -52,6 +52,9 @@ uv sync --group dev
 uv run pytest
 ```
 
+The repository CI runs the lockfile check, Ruff, Pyright, the full test suite,
+and distribution builds on Python 3.11–3.13.
+
 With `DEEPSEEK_API_KEY` configured, run one task:
 
 ```sh
