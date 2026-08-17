@@ -28,6 +28,7 @@ from ..goals import GoalError, GoalManager
 from ..jobs import JobHandle, JobOutcome, JobRegistry
 from ..llm import DeepSeekAdapter, LlmCallConfig, RetryPolicy
 from ..llm.adapter import LlmAdapter
+from ..lsp import LspRuntime, install_lsp_tools
 from ..message_feedback import MessageFeedbackManager
 from ..models import ImageContent, Message, TextContent
 from ..plans import fold as fold_plan_mode
@@ -291,6 +292,7 @@ class HarnessService:
         )
         self.web.register_fetch_provider(HttpFetchProvider())
         self.web.register_search_provider(DeepSeekSearchProvider(self._deepseek_search_options))
+        self.lsp = LspRuntime()
         self.workspaces = WorkspaceRegistry(state_root)
         self.skills = SkillRegistry()
         self._adapter_factory = adapter_factory or self._default_adapter
@@ -3556,6 +3558,7 @@ class HarnessService:
         disposers.extend(self._install_todo_tool(registry, session))
         disposers.extend(self._install_subagent_tools(registry, session))
         disposers.extend(install_dynamic_tools(registry, self.dynamic, session.id))
+        disposers.extend(install_lsp_tools(registry, self.lsp))
         disposers.extend(install_web_tools(registry, self.web))
         selection = session.header.model_selection or self._default_selection()
         provider = selection.get("provider")

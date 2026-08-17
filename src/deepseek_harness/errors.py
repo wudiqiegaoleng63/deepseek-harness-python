@@ -74,6 +74,14 @@ class WebError(HarnessError):
         self.status = status
 
 
+class LspError(HarnessError):
+    """Raised when the optional language-server capability cannot answer a query."""
+
+    def __init__(self, message: str, *, code: str = "LSP_ERROR") -> None:
+        super().__init__(message)
+        self.code = code
+
+
 @dataclass(frozen=True, slots=True)
 class LlmFailure:
     """Provider-neutral facts used by retry and terminal event policy."""
