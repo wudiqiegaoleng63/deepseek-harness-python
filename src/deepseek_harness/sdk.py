@@ -40,6 +40,7 @@ class DeepSeekHarnessConfig:
     shutdown_timeout_seconds: float = 5.0
     retry_policy: RetryPolicy | None = None
     compaction_policy: CompactionPolicy | None = None
+    spill_max_inline_bytes: int | None = 50_000
     adapter_factory: AdapterFactory | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -49,6 +50,12 @@ class DeepSeekHarnessConfig:
             raise ValueError("request_timeout_seconds must be positive or None")
         if self.shutdown_timeout_seconds <= 0:
             raise ValueError("shutdown_timeout_seconds must be positive")
+        if self.spill_max_inline_bytes is not None and (
+            isinstance(self.spill_max_inline_bytes, bool)
+            or not isinstance(self.spill_max_inline_bytes, int)
+            or self.spill_max_inline_bytes < 0
+        ):
+            raise ValueError("spill_max_inline_bytes must be a non-negative integer or None")
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +158,7 @@ class DeepSeekHarness:
                 adapter_factory=self.config.adapter_factory,
                 retry_policy=self.config.retry_policy,
                 compaction_policy=self.config.compaction_policy,
+                spill_max_inline_bytes=self.config.spill_max_inline_bytes,
             )
             self._runtime = runtime
             loop.run_until_complete(self._configure(runtime))

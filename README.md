@@ -22,6 +22,7 @@ The native Python host now contains:
 - configurable context-window protection with deterministic local checkpoints,
   balanced tool boundaries, and durable `compaction/*` events;
 - model-free tool-result pruning with replay-safe head/middle/tail replacements;
+- session-scoped private spill files with bounded previews for oversized results;
 - append-only Session events with atomic JSONL persistence, forked sessions, and
   durable one-shot/continuable subagents;
 - an Agent loop with tool-call continuation, cancellation, and queued prompts;
@@ -82,6 +83,11 @@ anonymous HTTP(S) provider with response, redirect, timeout, and output caps.
 `DEEPSEEK_SEARCH_BASE_URL` or update the `web-search-deepseek` settings namespace
 for a compatible endpoint; search and chat-completions intentionally keep
 separate base URLs.
+
+The default runtime spills successful plain-text tool results above 50,000
+UTF-8 bytes into private, session-scoped files and leaves the model a bounded
+head/tail preview plus a `read`/`grep` recovery locator. Configure or disable
+the policy through `DeepSeekHarnessConfig(spill_max_inline_bytes=...)`.
 
 Use the same runtime from Python:
 

@@ -41,6 +41,7 @@ from ..settings import (
     SettingsRegistry,
 )
 from ..skills import SkillRegistry
+from ..spill import LocalSpillStore, SpillPolicy
 from ..todos import TodoError, TodoManager
 from ..tool_result_pruner import ToolResultPruner
 from ..tools import PermissionMode, WorkspacePolicy, install_builtin_tools
@@ -169,6 +170,7 @@ class HarnessService:
         adapter_factory: AdapterFactory | None = None,
         retry_policy: RetryPolicy | None = None,
         compaction_policy: CompactionPolicy | None = None,
+        spill_max_inline_bytes: int | None = 50_000,
     ) -> None:
         self.store = JsonlSessionStore(session_root)
         state_root = self.store.root
@@ -178,6 +180,11 @@ class HarnessService:
         self.retry_policy = retry_policy
         self.compaction_policy = compaction_policy
         self.tool_result_pruner = ToolResultPruner()
+        self.spill_store = LocalSpillStore(state_root / "spills")
+        self.spill_policy = SpillPolicy(
+            self.spill_store,
+            max_inline_bytes=spill_max_inline_bytes,
+        )
         self.attachments = AttachmentStore(state_root)
         self.presets = AgentPresetRegistry(state_root)
         self.goals = GoalManager()
@@ -3517,9 +3524,13 @@ class HarnessService:
 
     def _attach(self, session: Session) -> SessionHandle:
         workspace = Path(session.header.cwd or self.cwd).expanduser().resolve()
-        registry = ToolRegistry()
+        registry = ToolRegistry(result_transformer=self.spill_policy.transform)
         permission_mode = self._effective_permission_mode()
-        policy = WorkspacePolicy(workspace, permission_mode)
+        policy = WorkspacePolicy(
+            workspace,
+            permission_mode,
+            extra_read_roots=(self.spill_store.session_root(session.id),),
+        )
         disposers = install_builtin_tools(
             registry,
             policy,

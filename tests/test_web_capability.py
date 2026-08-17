@@ -16,7 +16,7 @@ from deepseek_harness import (
 )
 from deepseek_harness.checkpoint import SessionCheckpointPolicy
 from deepseek_harness.tool_result_pruner import ToolResultPruner
-from deepseek_harness.tools.registry import ToolContext, ToolRegistry
+from deepseek_harness.tools.registry import ToolContext, ToolDefinition, ToolRegistry, ToolResult
 from deepseek_harness.web import HarnessService
 from deepseek_harness.web_capability import (
     WebFetchBody,
@@ -213,6 +213,42 @@ def test_harness_service_exposes_web_tools_and_search_settings(tmp_path) -> None
             item for item in described["namespaces"] if item["ns"] == "web-search-deepseek"
         )
         assert search["value"]["model"] == "deepseek-v4-flash"
+        await service.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_harness_service_spills_large_results_and_allows_owner_readback(tmp_path) -> None:
+    async def scenario() -> None:
+        service = HarnessService(tmp_path / "state", cwd=tmp_path)
+        handle = await service.create_session(session_id="spill-session", cwd=str(tmp_path))
+        body = "HEAD " + ("x" * 60_000) + " TAIL"
+        handle.agent.tools.register(
+            ToolDefinition(
+                "big_output",
+                "large test output",
+                {"type": "object", "additionalProperties": False},
+                lambda _args, _context: ToolResult(body),
+            )
+        )
+
+        result = await handle.agent.tools.execute(
+            "big_output",
+            "{}",
+            ToolContext(handle.session.id, str(tmp_path), "call-big"),
+        )
+        assert len(result.text.encode("utf-8")) <= 50_000
+        assert "Full formatted result stored at:" in result.text
+        spill_files = list(service.spill_store.root.rglob("*"))
+        files = [path for path in spill_files if path.is_file()]
+        assert len(files) == 1
+
+        read = await handle.agent.tools.execute(
+            "read",
+            json.dumps({"file_path": str(files[0]), "offset": 1, "limit": 5}),
+            ToolContext(handle.session.id, str(tmp_path), "call-read"),
+        )
+        assert body in read.text
         await service.dispose()
 
     asyncio.run(scenario())

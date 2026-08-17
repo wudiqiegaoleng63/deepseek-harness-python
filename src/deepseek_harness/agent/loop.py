@@ -257,7 +257,9 @@ class Agent:
                             call.name,
                             call.arguments,
                             ToolContext(
-                                session_id=self.session.id, cwd=self.session.header.cwd or "."
+                                session_id=self.session.id,
+                                cwd=self.session.header.cwd or ".",
+                                call_id=call.call_id,
                             ),
                         )
                         tool_message = create_tool_message(call.call_id, result.text)

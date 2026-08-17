@@ -28,6 +28,15 @@ from .sdk_process import (
     ProcessSession,
 )
 from .session import JsonlSessionStore, Session, SessionEvent, SessionHeader, SessionSurfaceNode
+from .spill import (
+    LocalSpillStore,
+    SaveTextSpill,
+    SpillOwner,
+    SpillPolicy,
+    SpillRef,
+    SpillSource,
+    SpillStore,
+)
 from .tool_result_pruner import (
     DEFAULT_TOOL_RESULT_PRUNE_CONFIG,
     PRUNE_MARKER,
@@ -83,6 +92,13 @@ __all__ = [
     "SessionHeader",
     "SessionSurfaceNode",
     "SessionCheckpointPolicy",
+    "LocalSpillStore",
+    "SaveTextSpill",
+    "SpillOwner",
+    "SpillPolicy",
+    "SpillRef",
+    "SpillSource",
+    "SpillStore",
     "StreamChunk",
     "TextContent",
     "ToolCallContent",

@@ -7,6 +7,7 @@ processes with Landlock/ACL restrictions before enabling untrusted shell work.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -22,9 +23,15 @@ class PermissionMode(StrEnum):
 class WorkspacePolicy:
     root: Path
     mode: PermissionMode = PermissionMode.WORKSPACE_WRITE
+    extra_read_roots: Sequence[Path] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "root", self.root.expanduser().resolve())
+        object.__setattr__(
+            self,
+            "extra_read_roots",
+            tuple(path.expanduser().resolve() for path in self.extra_read_roots),
+        )
 
     def resolve(self, raw_path: str) -> Path:
         candidate = Path(raw_path).expanduser()
@@ -36,7 +43,10 @@ class WorkspacePolicy:
         path = self.resolve(raw_path)
         if self.mode is PermissionMode.DANGER_FULL_ACCESS:
             return path
-        self._assert_inside(path)
+        if not self._inside(path, self.root) and not any(
+            self._inside(path, extra_root) for extra_root in self.extra_read_roots
+        ):
+            raise PermissionError(f"path escapes the workspace: {path}")
         return path
 
     def assert_writable(self, raw_path: str) -> Path:
@@ -56,7 +66,13 @@ class WorkspacePolicy:
             )
 
     def _assert_inside(self, path: Path) -> None:
+        if not self._inside(path, self.root):
+            raise PermissionError(f"path escapes the workspace: {path}")
+
+    @staticmethod
+    def _inside(path: Path, root: Path) -> bool:
         try:
-            path.relative_to(self.root)
-        except ValueError as exc:
-            raise PermissionError(f"path escapes the workspace: {path}") from exc
+            path.relative_to(root)
+        except ValueError:
+            return False
+        return True

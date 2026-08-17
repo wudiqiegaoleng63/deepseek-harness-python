@@ -18,6 +18,7 @@ from ..llm.types import ToolSchema
 class ToolContext:
     session_id: str
     cwd: str
+    call_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +29,9 @@ class ToolResult:
 
 
 ToolExecutor = Callable[[dict[str, Any], ToolContext], ToolResult | Awaitable[ToolResult]]
+ToolResultTransformer = Callable[
+    [str, ToolContext, ToolResult], ToolResult | Awaitable[ToolResult]
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,8 +55,9 @@ class ToolDefinition:
 class ToolRegistry:
     """Register, expose, and execute tools with strict call-name lookup."""
 
-    def __init__(self) -> None:
+    def __init__(self, result_transformer: ToolResultTransformer | None = None) -> None:
         self._tools: dict[str, ToolDefinition] = {}
+        self._result_transformer = result_transformer
 
     def register(self, definition: ToolDefinition) -> Callable[[], None]:
         if not definition.name or definition.name in self._tools:
@@ -97,6 +102,13 @@ class ToolRegistry:
                     result = await wait_for(result, definition.timeout_seconds)
             if not isinstance(result, ToolResult):
                 raise TypeError("tool executor must return ToolResult")
+            if self._result_transformer is not None:
+                transformed = self._result_transformer(name, context, result)
+                if inspect.isawaitable(transformed):
+                    transformed = await transformed
+                if not isinstance(transformed, ToolResult):
+                    raise TypeError("tool result transformer must return ToolResult")
+                result = transformed
             return result
         except TimeoutError:
             timeout = definition.timeout_seconds
