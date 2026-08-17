@@ -16,6 +16,15 @@ from .compaction import (
     estimate_messages_tokens,
 )
 from .errors import LlmFailure, LspError, WebError
+from .instructions import (
+    DEFAULT_INSTRUCTION_FILE_CANDIDATES,
+    DEFAULT_LOCAL_INSTRUCTION_FILE_CANDIDATES,
+    DEFAULT_MAX_INSTRUCTION_BYTES,
+    DEFAULT_MAX_INSTRUCTION_SOURCE_BYTES,
+    DEFAULT_PROJECT_ROOT_MARKERS,
+    InstructionFile,
+    WorkspaceInstructionLoader,
+)
 from .llm import DeepSeekAdapter, LlmAdapter, LlmCallConfig, LlmRequest, RetryPolicy, StreamChunk
 from .lsp import (
     DEFAULT_LSP_TOOL_TIMEOUT_SECONDS,
@@ -141,6 +150,13 @@ __all__ = [
     "CompactionPolicy",
     "CompactionResult",
     "ManualCompactionError",
+    "DEFAULT_INSTRUCTION_FILE_CANDIDATES",
+    "DEFAULT_LOCAL_INSTRUCTION_FILE_CANDIDATES",
+    "DEFAULT_MAX_INSTRUCTION_BYTES",
+    "DEFAULT_MAX_INSTRUCTION_SOURCE_BYTES",
+    "DEFAULT_PROJECT_ROOT_MARKERS",
+    "InstructionFile",
+    "WorkspaceInstructionLoader",
     "context_breakdown_projection",
     "context_pressure_projection",
     "CUSTOM_PERMISSION_PRESET",

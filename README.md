@@ -55,6 +55,8 @@ The native Python host now contains:
   live shell registration only for `danger-full-access`;
 - durable request metadata plus replayable `tokenUsage`, `contextPressure`,
   `contextBreakdown`, and `sessionStats` projections for the shared chat UI;
+- bounded, durable workspace instruction baselines from `AGENTS.md` and
+  `CLAUDE.md`, refreshed between model steps with UTF-8 source limits;
 - the UI-backed `ask_user_question` tool and pending question response flow;
 - `messageFeedback/list|put|delete` with lifecycle fencing, compare-and-set
   versions, note validation, and a durable JSON sidecar;

@@ -36,6 +36,7 @@ from ..tools.registry import ToolContext, ToolRegistry
 
 AgentStatus = Literal["idle", "running", "disposed"]
 EventListener = Callable[[SessionEvent], Any | Awaitable[Any]]
+InstructionProvider = Callable[[Session], Awaitable[Message | None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +71,7 @@ class Agent:
         compaction_policy: CompactionPolicy | None = None,
         tool_result_pruner: ToolResultPruner | None = None,
         checkpoint_policy: SessionCheckpointPolicy | None = None,
+        instruction_provider: InstructionProvider | None = None,
     ) -> None:
         self.session = session
         self.llm = llm
@@ -81,6 +83,7 @@ class Agent:
         self.compaction_policy = compaction_policy or CompactionPolicy()
         self.tool_result_pruner = tool_result_pruner
         self.checkpoint_policy = checkpoint_policy
+        self.instruction_provider = instruction_provider
         self.status: AgentStatus = "idle"
         self._listeners: list[EventListener] = []
         self._run_lock = asyncio.Lock()
@@ -189,6 +192,12 @@ class Agent:
 
         try:
             for step in range(1, self.max_steps + 1):
+                if self.instruction_provider is not None:
+                    instruction = await self.instruction_provider(self.session)
+                    if instruction is not None:
+                        await self._append(
+                            "user/message", {"message": instruction.to_dict()}
+                        )
                 await self._append("step/start", {"turn": turn, "step": step})
                 system = self._resolved_system_prompt()
                 tools = self.tools.schemas()

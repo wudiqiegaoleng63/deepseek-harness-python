@@ -25,6 +25,7 @@ from ..compaction import CompactionPolicy, ManualCompactionError
 from ..dynamic_cordis import DynamicCordisService, install_dynamic_tools
 from ..errors import HarnessError
 from ..goals import GoalError, GoalManager
+from ..instructions import WorkspaceInstructionLoader
 from ..jobs import JobHandle, JobOutcome, JobRegistry
 from ..llm import DeepSeekAdapter, LlmCallConfig, RetryPolicy
 from ..llm.adapter import LlmAdapter
@@ -194,6 +195,9 @@ class HarnessService:
         compaction_policy: CompactionPolicy | None = None,
         spill_max_inline_bytes: int | None = 50_000,
         session_title_llm: SessionTitleLlmConfig | None = None,
+        agent_instructions_max_bytes: int = 65_536,
+        agent_instructions_max_source_bytes: int = 1_048_576,
+        dsh_home: str | os.PathLike[str] | None = None,
     ) -> None:
         self.store = JsonlSessionStore(session_root)
         state_root = self.store.root
@@ -209,6 +213,11 @@ class HarnessService:
             max_inline_bytes=spill_max_inline_bytes,
         )
         self.session_title_llm = session_title_llm
+        self.instruction_loader = WorkspaceInstructionLoader(
+            dsh_home=dsh_home,
+            max_bytes=agent_instructions_max_bytes,
+            max_source_bytes=agent_instructions_max_source_bytes,
+        )
         self.attachments = AttachmentStore(state_root)
         self.presets = AgentPresetRegistry(state_root)
         self.goals = GoalManager()
@@ -3804,6 +3813,7 @@ class HarnessService:
             compaction_policy=self.compaction_policy,
             tool_result_pruner=self.tool_result_pruner,
             checkpoint_policy=SessionCheckpointPolicy(self.store.save),
+            instruction_provider=self.instruction_loader.prepare,
         )
         handle = SessionHandle(session, agent, disposers, policy, shell_disposers)
         agent.subscribe(lambda event: self._on_agent_event(session, event))
