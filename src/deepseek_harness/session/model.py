@@ -89,6 +89,18 @@ class SessionEvent:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class SessionSurfaceNode:
+    """One message currently visible to the model-facing session surface."""
+
+    event: SessionEvent
+    message: Message
+
+    @property
+    def seq(self) -> int:
+        return self.event.seq
+
+
 class Session:
     """In-memory append-only log and model-history projection."""
 
@@ -169,7 +181,23 @@ class Session:
         return event
 
     def derive_messages(self) -> tuple[Message, ...]:
-        messages: list[Message] = []
+        return tuple(node.message for node in self.current_surface())
+
+    def current_surface(self) -> tuple[SessionSurfaceNode, ...]:
+        """Return the replayed message surface with its source event coordinates.
+
+        The append-only event log remains lossless.  Surface replacements such
+        as model-free tool-result pruning only change this derived view, which
+        lets compaction and replay use the same message sequence.
+        """
+
+        return tuple(
+            SessionSurfaceNode(event, message)
+            for event, message in self._derive_message_nodes()
+        )
+
+    def _derive_message_nodes(self) -> list[tuple[SessionEvent, Message]]:
+        nodes: list[tuple[SessionEvent, Message]] = []
         active_compaction_id: str | None = None
         for event in self._events:
             if event.type == "compaction/summary":
@@ -188,11 +216,11 @@ class Session:
                     else None
                 )
                 retained = (
-                    [message for message in messages if message.id not in shadowed_ids]
+                    [node for node in nodes if node[1].id not in shadowed_ids]
                     if shadowed_ids is not None
                     else []
                 )
-                messages = ([checkpoint] if checkpoint is not None else []) + retained
+                nodes = ([(event, checkpoint)] if checkpoint is not None else []) + retained
                 continue
             if event.type in {"user/message", "assistant/message", "tool/result"}:
                 raw = event.data.get("message")
@@ -200,23 +228,45 @@ class Session:
                     message = _message_from_raw(raw, self._attachment_data)
                     if message is None:
                         continue
+                    surface_op = event.data.get("surfaceOp")
+                    if isinstance(surface_op, dict) and surface_op.get("op") == "replace":
+                        start = surface_op.get("start")
+                        end = surface_op.get("end")
+                        if (
+                            isinstance(start, int)
+                            and not isinstance(start, bool)
+                            and isinstance(end, int)
+                            and not isinstance(end, bool)
+                            and start <= end
+                        ):
+                            positions = [
+                                index
+                                for index, (source, _message) in enumerate(nodes)
+                                if start <= source.seq <= end
+                            ]
+                            if positions:
+                                first, last = positions[0], positions[-1]
+                                nodes[first : last + 1] = [(event, message)]
+                            else:
+                                nodes.append((event, message))
+                            continue
                     if (
                         event.type == "user/message"
                         and active_compaction_id is not None
                         and _is_compaction_checkpoint(message, active_compaction_id)
                     ):
-                        if messages and _is_compaction_checkpoint(
-                            messages[0], active_compaction_id
+                        if nodes and _is_compaction_checkpoint(
+                            nodes[0][1], active_compaction_id
                         ):
-                            messages[0] = message
+                            nodes[0] = (event, message)
                         else:
-                            messages = [message, *messages]
+                            nodes.insert(0, (event, message))
                         active_compaction_id = None
                     else:
-                        messages.append(message)
+                        nodes.append((event, message))
                         if event.type == "user/message":
                             active_compaction_id = None
-        return tuple(messages)
+        return nodes
 
     def register_attachment_data(self, attachment_id: str, data: str) -> None:
         """Make an admitted upload available to the current model request."""

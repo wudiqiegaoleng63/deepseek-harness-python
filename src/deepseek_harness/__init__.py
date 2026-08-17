@@ -6,6 +6,7 @@ on the same Session and Agent contracts.
 """
 
 from .agent import Agent, AgentStatus, RunResult
+from .checkpoint import CheckpointCallback, SessionCheckpointPolicy
 from .compaction import (
     CompactionPolicy,
     CompactionResult,
@@ -26,7 +27,15 @@ from .sdk_process import (
     ProcessRunResult,
     ProcessSession,
 )
-from .session import JsonlSessionStore, Session, SessionEvent, SessionHeader
+from .session import JsonlSessionStore, Session, SessionEvent, SessionHeader, SessionSurfaceNode
+from .tool_result_pruner import (
+    DEFAULT_TOOL_RESULT_PRUNE_CONFIG,
+    PRUNE_MARKER,
+    PrunedEntry,
+    PruneResult,
+    ToolResultPruneConfig,
+    ToolResultPruner,
+)
 from .web_capability import (
     DeepSeekSearchOptions,
     DeepSeekSearchProvider,
@@ -45,6 +54,7 @@ from .web_capability import (
 __all__ = [
     "Agent",
     "AgentStatus",
+    "CheckpointCallback",
     "CompactionPolicy",
     "CompactionResult",
     "DeepSeekAdapter",
@@ -62,16 +72,23 @@ __all__ = [
     "NotificationSubscription",
     "ProcessSession",
     "ProcessRunResult",
+    "PRUNE_MARKER",
+    "PruneResult",
+    "PrunedEntry",
     "RunResult",
     "RetryPolicy",
     "SdkRunResult",
     "Session",
     "SessionEvent",
     "SessionHeader",
+    "SessionSurfaceNode",
+    "SessionCheckpointPolicy",
     "StreamChunk",
     "TextContent",
     "ToolCallContent",
     "ToolResultContent",
+    "ToolResultPruneConfig",
+    "ToolResultPruner",
     "WebError",
     "WebFetchBody",
     "WebFetchResult",
@@ -88,4 +105,5 @@ __all__ = [
     "format_fetch_output",
     "format_search_output",
     "install_web_tools",
+    "DEFAULT_TOOL_RESULT_PRUNE_CONFIG",
 ]

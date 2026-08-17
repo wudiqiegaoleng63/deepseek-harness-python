@@ -20,6 +20,7 @@ import httpx
 from ..agent import Agent
 from ..agent_presets import AgentPresetError, AgentPresetRegistry
 from ..attachments import IMAGE_MEDIA_TYPES, AttachmentError, AttachmentStore, ImageAttachment
+from ..checkpoint import SessionCheckpointPolicy
 from ..compaction import CompactionPolicy
 from ..dynamic_cordis import DynamicCordisService, install_dynamic_tools
 from ..errors import HarnessError
@@ -41,6 +42,7 @@ from ..settings import (
 )
 from ..skills import SkillRegistry
 from ..todos import TodoError, TodoManager
+from ..tool_result_pruner import ToolResultPruner
 from ..tools import PermissionMode, WorkspacePolicy, install_builtin_tools
 from ..tools.registry import ToolContext, ToolDefinition, ToolRegistry, ToolResult
 from ..web_capability import (
@@ -175,6 +177,7 @@ class HarnessService:
         self.permission_mode = permission_mode
         self.retry_policy = retry_policy
         self.compaction_policy = compaction_policy
+        self.tool_result_pruner = ToolResultPruner()
         self.attachments = AttachmentStore(state_root)
         self.presets = AgentPresetRegistry(state_root)
         self.goals = GoalManager()
@@ -3589,6 +3592,8 @@ class HarnessService:
             system_prompt=system_prompt,
             retry_policy=self.retry_policy,
             compaction_policy=self.compaction_policy,
+            tool_result_pruner=self.tool_result_pruner,
+            checkpoint_policy=SessionCheckpointPolicy(self.store.save),
         )
         handle = SessionHandle(session, agent, disposers)
         agent.subscribe(lambda event: self._publish_event(session.id, event))

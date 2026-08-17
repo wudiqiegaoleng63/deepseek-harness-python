@@ -21,10 +21,12 @@ The native Python host now contains:
   `llm/retry` lifecycle events for transient outages;
 - configurable context-window protection with deterministic local checkpoints,
   balanced tool boundaries, and durable `compaction/*` events;
+- model-free tool-result pruning with replay-safe head/middle/tail replacements;
 - append-only Session events with atomic JSONL persistence, forked sessions, and
   durable one-shot/continuable subagents;
 - an Agent loop with tool-call continuation, cancellation, and queued prompts;
 - per-tool cancellable timeout policy with durable timeout results;
+- semantic durability checkpoints before model requests and top-level tool dispatch;
 - workspace-bounded canonical DSH `read`, `write`, `edit`, `glob`, `grep`, and
   `str_replace_editor` tools, plus optional shell and background jobs;
 - model-facing `subagent`, `subagent_fork`, `send_message`, `interrupt_agent`,
@@ -118,6 +120,12 @@ The first backend uses a deterministic local checkpoint and does not spend an
 additional model call on summarization. Its public `CompactionPolicy` and
 durable event seam are intentionally compatible with adding a provider-backed
 summarizer later.
+
+Oversized tool results are pruned before pressure compaction using the same
+default budgets as DSH: 8192 Unicode code points total, retaining the first
+4096 and last 1024 around a durable `[... tool result middle pruned ...]`
+marker. The original result remains in the append-only log and replay projects
+the replacement onto the model-visible surface.
 
 For an isolated child process, use the compatible SDK runtime over newline-
 delimited JSON-RPC. The low-level protocol supports `initialize`,

@@ -18,7 +18,7 @@ import math
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from .llm.types import ToolSchema
 from .models import (
@@ -30,6 +30,9 @@ from .models import (
     ToolResultContent,
 )
 from .session import Session, SessionEvent
+
+if TYPE_CHECKING:
+    from .tool_result_pruner import ToolResultPruner
 
 CompactionTrigger = Literal["pressure", "context-overflow", "manual"]
 CompactionAppender = Callable[[str, dict[str, JsonValue]], Awaitable[SessionEvent]]
@@ -167,6 +170,7 @@ async def compact_if_needed(
     overhead_tokens: int = 0,
     trigger: CompactionTrigger = "pressure",
     turn: int | None = None,
+    pruner: ToolResultPruner | None = None,
 ) -> CompactionResult | None:
     """Replace an old message prefix with a durable checkpoint when pressured.
 
@@ -186,6 +190,16 @@ async def compact_if_needed(
     )
     if estimated_before <= policy.threshold_tokens:
         return None
+
+    if pruner is not None:
+        pruned = pruner.prune_session(session)
+        if pruned.pruned:
+            messages = session.derive_messages()
+            estimated_before = overhead_tokens + estimate_messages_tokens(
+                messages, chars_per_token=policy.chars_per_token
+            )
+            if estimated_before <= policy.threshold_tokens:
+                return None
 
     cut = _select_cut(messages, policy)
     if cut is None:

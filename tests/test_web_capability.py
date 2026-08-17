@@ -14,6 +14,8 @@ from deepseek_harness import (
     WebRuntime,
     format_fetch_output,
 )
+from deepseek_harness.checkpoint import SessionCheckpointPolicy
+from deepseek_harness.tool_result_pruner import ToolResultPruner
 from deepseek_harness.tools.registry import ToolContext, ToolRegistry
 from deepseek_harness.web import HarnessService
 from deepseek_harness.web_capability import (
@@ -204,6 +206,8 @@ def test_harness_service_exposes_web_tools_and_search_settings(tmp_path) -> None
         service = HarnessService(tmp_path / "state", cwd=tmp_path)
         handle = await service.create_session(session_id="web-session", cwd=str(tmp_path))
         assert {"web_search", "web_fetch"}.issubset(set(handle.agent.tools.names()))
+        assert isinstance(handle.agent.tool_result_pruner, ToolResultPruner)
+        assert isinstance(handle.agent.checkpoint_policy, SessionCheckpointPolicy)
         described = await service.dispatch("settings.describe", {})
         search = next(
             item for item in described["namespaces"] if item["ns"] == "web-search-deepseek"

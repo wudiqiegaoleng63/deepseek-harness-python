@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from ..checkpoint import SessionCheckpointPolicy
 from ..compaction import (
     CompactionPolicy,
     compact_if_needed,
@@ -26,6 +27,7 @@ from ..models import (
     create_user_message,
 )
 from ..session import Session, SessionEvent
+from ..tool_result_pruner import ToolResultPruner
 from ..tools.registry import ToolContext, ToolRegistry
 
 AgentStatus = Literal["idle", "running", "disposed"]
@@ -62,6 +64,8 @@ class Agent:
         max_steps: int = 64,
         retry_policy: RetryPolicy | None = None,
         compaction_policy: CompactionPolicy | None = None,
+        tool_result_pruner: ToolResultPruner | None = None,
+        checkpoint_policy: SessionCheckpointPolicy | None = None,
     ) -> None:
         self.session = session
         self.llm = llm
@@ -71,6 +75,8 @@ class Agent:
         self.max_steps = max_steps
         self.retry_policy = retry_policy or RetryPolicy()
         self.compaction_policy = compaction_policy or CompactionPolicy()
+        self.tool_result_pruner = tool_result_pruner
+        self.checkpoint_policy = checkpoint_policy
         self.status: AgentStatus = "idle"
         self._listeners: list[EventListener] = []
         self._run_lock = asyncio.Lock()
@@ -148,6 +154,7 @@ class Agent:
                     ),
                     trigger="pressure",
                     turn=turn,
+                    pruner=self.tool_result_pruner,
                 )
                 retry = 0
                 while True:
@@ -161,6 +168,8 @@ class Agent:
                         system=system,
                         tools=tools,
                     )
+                    if self.checkpoint_policy is not None:
+                        await self.checkpoint_policy.before_model_request(self.session)
                     try:
                         async for chunk in self.llm.stream(request):
                             await self._append(
@@ -242,6 +251,8 @@ class Agent:
                                 "arguments": call.arguments,
                             },
                         )
+                        if self.checkpoint_policy is not None:
+                            await self.checkpoint_policy.before_tool_dispatch(self.session)
                         result = await self.tools.execute(
                             call.name,
                             call.arguments,
