@@ -65,6 +65,14 @@ from .session_title import (
     normalize_session_title,
     truncate_title_utf8,
 )
+from .session_title_llm import (
+    SESSION_TITLE_TIMEOUT_CODE,
+    TITLE_PROVIDER_ID,
+    SessionTitleLlmConfig,
+    SessionTitleLlmError,
+    SessionTitleLlmResult,
+    generate_session_title,
+)
 from .spill import (
     LocalSpillStore,
     SaveTextSpill,
@@ -147,6 +155,9 @@ __all__ = [
     "SessionTitleInvalidError",
     "SessionTitleService",
     "SessionTitleSnapshot",
+    "SessionTitleLlmConfig",
+    "SessionTitleLlmError",
+    "SessionTitleLlmResult",
     "LocalSpillStore",
     "SaveTextSpill",
     "SpillOwner",
@@ -193,4 +204,7 @@ __all__ = [
     "fold_session_title",
     "normalize_session_title",
     "truncate_title_utf8",
+    "SESSION_TITLE_TIMEOUT_CODE",
+    "TITLE_PROVIDER_ID",
+    "generate_session_title",
 ]

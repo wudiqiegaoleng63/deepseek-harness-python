@@ -15,6 +15,7 @@ from typing import Any, TypeVar
 from .compaction import CompactionPolicy
 from .llm.adapter import LlmAdapter
 from .llm.types import RetryPolicy
+from .session_title_llm import SessionTitleLlmConfig
 from .tools import PermissionMode
 from .web.service import HarnessService
 
@@ -41,6 +42,7 @@ class DeepSeekHarnessConfig:
     retry_policy: RetryPolicy | None = None
     compaction_policy: CompactionPolicy | None = None
     spill_max_inline_bytes: int | None = 50_000
+    session_title_llm: SessionTitleLlmConfig | None = None
     adapter_factory: AdapterFactory | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -159,6 +161,7 @@ class DeepSeekHarness:
                 retry_policy=self.config.retry_policy,
                 compaction_policy=self.config.compaction_policy,
                 spill_max_inline_bytes=self.config.spill_max_inline_bytes,
+                session_title_llm=self.config.session_title_llm,
             )
             self._runtime = runtime
             loop.run_until_complete(self._configure(runtime))

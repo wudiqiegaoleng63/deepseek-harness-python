@@ -24,6 +24,8 @@ The native Python host now contains:
 - model-free tool-result pruning with replay-safe head/middle/tail replacements;
 - session-scoped private spill files with bounded previews for oversized results;
 - deterministic, durable session titles with control-code sanitization and rename pinning;
+- optional first-prompt model title generation with bounded input/output, timeout, and a
+  deterministic fallback when the auxiliary call fails;
 - append-only Session events with atomic JSONL persistence, forked sessions, and
   durable one-shot/continuable subagents;
 - an Agent loop with tool-call continuation, cancellation, and queued prompts;
@@ -127,6 +129,11 @@ The first backend uses a deterministic local checkpoint and does not spend an
 additional model call on summarization. Its public `CompactionPolicy` and
 durable event seam are intentionally compatible with adding a provider-backed
 summarizer later.
+
+Model-backed first-prompt titles are opt-in so embedding applications can control
+the extra request budget. Pass `session_title_llm=SessionTitleLlmConfig(...)` to
+`HarnessService`; a failed or timed-out auxiliary request leaves the fallback title
+in place and records its request envelope as `session/title-llm-request`.
 
 Oversized tool results are pruned before pressure compaction using the same
 default budgets as DSH: 8192 Unicode code points total, retaining the first

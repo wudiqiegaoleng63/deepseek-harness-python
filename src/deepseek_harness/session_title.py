@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from .models import JsonValue, message_from_dict
@@ -145,6 +146,42 @@ class SessionTitleService:
         return session.append(
             "session/title",
             {"title": title, "messageSeqs": [], "source": {"kind": "user"}},
+        )
+
+    def accept_provider(
+        self,
+        session: Session,
+        raw_title: str,
+        message_seqs: Sequence[int],
+        *,
+        provider: str,
+        model: str,
+    ) -> SessionEvent | None:
+        """Accept a current model title unless an explicit rename already pinned it."""
+
+        current = self.get(session)
+        if current is not None and current.source.get("kind") == "user":
+            return None
+        if not provider.strip() or not model.strip():
+            raise ValueError("provider title route must contain provider and model")
+        if not message_seqs or any(
+            isinstance(seq, bool) or not isinstance(seq, int) or seq < 0 for seq in message_seqs
+        ):
+            raise ValueError("provider title must identify source message sequences")
+        title = normalize_session_title(raw_title, self.config.max_title_bytes)
+        if not title:
+            raise SessionTitleInvalidError("session title provider returned no visible text")
+        return session.append(
+            "session/title",
+            {
+                "title": title,
+                "messageSeqs": list(message_seqs),
+                "source": {
+                    "kind": "provider",
+                    "provider": provider,
+                    "model": {"provider": provider, "model": model},
+                },
+            },
         )
 
     def refresh_fallback(self, session: Session) -> SessionEvent | None:

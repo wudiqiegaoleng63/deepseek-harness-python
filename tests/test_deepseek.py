@@ -131,3 +131,38 @@ def test_deepseek_adapter_classifies_rate_limit_and_retry_after() -> None:
         await adapter.aclose()
 
     asyncio.run(scenario())
+
+
+def test_deepseek_adapter_disables_thinking_for_session_title_requests() -> None:
+    async def scenario() -> None:
+        captured: dict[str, object] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.update(json.loads(request.content))
+            body = 'data: {"choices":[{"delta":{"content":"title"}}]}\n\n'
+            body += 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            body += "data: [DONE]\n\n"
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=body.encode(),
+                request=request,
+            )
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        adapter = DeepSeekAdapter(api_key="test-key", client=client)
+        request = LlmRequest(
+            messages=(create_user_message("title this"),),
+            config=LlmCallConfig(
+                model="deepseek-v4-flash",
+                thinking="enabled",
+                reasoning_effort="max",
+            ),
+            purpose="session-title",
+        )
+        _ = [chunk async for chunk in adapter.stream(request)]
+        assert captured["thinking"] == {"type": "disabled"}
+        assert "reasoning_effort" not in captured
+        await adapter.aclose()
+
+    asyncio.run(scenario())

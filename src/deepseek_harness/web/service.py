@@ -30,7 +30,7 @@ from ..llm import DeepSeekAdapter, LlmCallConfig, RetryPolicy
 from ..llm.adapter import LlmAdapter
 from ..lsp import LspRuntime, install_lsp_tools
 from ..message_feedback import MessageFeedbackManager
-from ..models import ImageContent, Message, TextContent
+from ..models import ImageContent, Message, TextContent, message_from_dict
 from ..plans import fold as fold_plan_mode
 from ..plans import has_open_turn
 from ..session import JsonlSessionStore, Session, SessionEvent
@@ -38,6 +38,10 @@ from ..session_title import (
     SessionTitleInvalidError,
     SessionTitleService,
     fold_session_title,
+)
+from ..session_title_llm import (
+    SessionTitleLlmConfig,
+    generate_session_title,
 )
 from ..settings import (
     CredentialError,
@@ -177,6 +181,7 @@ class HarnessService:
         retry_policy: RetryPolicy | None = None,
         compaction_policy: CompactionPolicy | None = None,
         spill_max_inline_bytes: int | None = 50_000,
+        session_title_llm: SessionTitleLlmConfig | None = None,
     ) -> None:
         self.store = JsonlSessionStore(session_root)
         state_root = self.store.root
@@ -191,6 +196,7 @@ class HarnessService:
             self.spill_store,
             max_inline_bytes=spill_max_inline_bytes,
         )
+        self.session_title_llm = session_title_llm
         self.attachments = AttachmentStore(state_root)
         self.presets = AgentPresetRegistry(state_root)
         self.goals = GoalManager()
@@ -310,6 +316,7 @@ class HarnessService:
         self._queue_lock = asyncio.Lock()
         self._pending_approvals: dict[str, PendingApproval] = {}
         self._pending_questions: dict[str, PendingQuestion] = {}
+        self._session_title_tasks: dict[str, asyncio.Task[None]] = {}
         self._disposed = False
 
     async def create_session(
@@ -1064,6 +1071,7 @@ class HarnessService:
             raw_title = payload.get("title")
             if not isinstance(raw_title, str):
                 raise ApiFault("bad-request", "title must be a string")
+            self._cancel_session_title_task(session_id)
             try:
                 event = self.session_titles.rename(handle.session, raw_title)
             except SessionTitleInvalidError as exc:
@@ -1742,6 +1750,13 @@ class HarnessService:
             await self._finish_approval(rpc_id, "cancelled")
         for rpc_id in tuple(self._pending_questions):
             await self._finish_question(rpc_id, "cancelled")
+        title_tasks = tuple(self._session_title_tasks.values())
+        for task in title_tasks:
+            if not task.done():
+                task.cancel()
+        if title_tasks:
+            await asyncio.gather(*title_tasks, return_exceptions=True)
+        self._session_title_tasks.clear()
         handles = tuple(self._handles.values())
         for handle in handles:
             if handle.task is not None and not handle.task.done():
@@ -3697,6 +3712,73 @@ class HarnessService:
         title = self.session_titles.on_user_message(session, event)
         if title is not None:
             self._publish_event(session.id, title)
+            if (
+                self.session_title_llm is not None
+                and session.header.parent_session is None
+            ):
+                self._schedule_session_title_llm(session, event)
+
+    def _schedule_session_title_llm(self, session: Session, event: SessionEvent) -> None:
+        existing = self._session_title_tasks.get(session.id)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(self._run_session_title_llm(session, event))
+        self._session_title_tasks[session.id] = task
+
+    async def _run_session_title_llm(self, session: Session, event: SessionEvent) -> None:
+        current_task = asyncio.current_task()
+        try:
+            raw_message = event.data.get("message")
+            if not isinstance(raw_message, dict):
+                return
+            message = message_from_dict(raw_message)
+            if not message.text.strip():
+                return
+            selection = session.header.model_selection or self._default_selection()
+            route_provider = selection.get("provider")
+            route_model = selection.get("model")
+            provider = route_provider if isinstance(route_provider, str) else "deepseek-official"
+            model = route_model if isinstance(route_model, str) else self.model
+            result = await generate_session_title(
+                session,
+                ((event.seq, message.text),),
+                route_provider=provider,
+                route_model=model,
+                adapter_factory=self._adapter_factory,
+                config=self.session_title_llm
+                if self.session_title_llm is not None
+                else SessionTitleLlmConfig(),
+            )
+            accepted = self.session_titles.accept_provider(
+                session,
+                result.title,
+                result.message_seqs,
+                provider=result.provider,
+                model=result.model,
+            )
+            if accepted is not None:
+                await self.store.save(session)
+                self._publish_event(session.id, accepted)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The deterministic fallback is already durable.  Auxiliary title failures are
+            # intentionally non-fatal to the main turn and leave the request record for audit.
+            try:
+                await self.store.save(session)
+            except Exception:
+                pass
+        finally:
+            if (
+                current_task is not None
+                and self._session_title_tasks.get(session.id) is current_task
+            ):
+                self._session_title_tasks.pop(session.id, None)
+
+    def _cancel_session_title_task(self, session_id: str) -> None:
+        task = self._session_title_tasks.pop(session_id, None)
+        if task is not None and not task.done():
+            task.cancel()
 
     def _publish_mux(self, frame: Frame) -> None:
         for queue in tuple(self._mux_subscribers):

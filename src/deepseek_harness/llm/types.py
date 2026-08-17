@@ -108,6 +108,8 @@ class LlmRequest:
     config: LlmCallConfig
     system: str | None = None
     tools: tuple[ToolSchema, ...] = ()
+    purpose: Literal["conversation", "compaction", "session-title"] = "conversation"
+    session_id: str | None = None
 
 
 StreamKind: TypeAlias = Literal["text", "reasoning", "tool-call-delta", "done"]

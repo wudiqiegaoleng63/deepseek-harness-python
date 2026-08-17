@@ -53,9 +53,14 @@ class DeepSeekAdapter:
         ):
             if value is not None:
                 payload[key] = value
-        if request.config.thinking is not None:
+        if request.purpose == "session-title":
+            payload["thinking"] = {"type": "disabled"}
+        elif request.config.thinking is not None:
             payload["thinking"] = {"type": request.config.thinking}
-        if request.config.reasoning_effort not in {None, "off"}:
+        if request.purpose != "session-title" and request.config.reasoning_effort not in {
+            None,
+            "off",
+        }:
             payload["reasoning_effort"] = request.config.reasoning_effort
 
         try:
