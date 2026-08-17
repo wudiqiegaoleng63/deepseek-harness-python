@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from math import inf
 
 from deepseek_harness.tools import PermissionMode, WorkspacePolicy, install_builtin_tools
-from deepseek_harness.tools.registry import ToolContext, ToolRegistry
+from deepseek_harness.tools.registry import ToolContext, ToolDefinition, ToolRegistry, ToolResult
 
 
 def test_builtin_file_tools_are_workspace_bounded(tmp_path) -> None:
@@ -127,3 +128,40 @@ def test_canonical_filesystem_tools_cover_read_edit_glob_grep_and_editor(tmp_pat
                 dispose()
 
     asyncio.run(scenario())
+
+
+def test_tool_registry_enforces_cancellable_definition_timeout() -> None:
+    async def slow(_args, _context):
+        await asyncio.sleep(1)
+        return ToolResult("late")
+
+    with_timeout = ToolRegistry()
+    with_timeout.register(
+        ToolDefinition(
+            "slow",
+            "A deliberately slow test tool.",
+            {"type": "object", "additionalProperties": False},
+            slow,
+            timeout_seconds=0.001,
+        )
+    )
+
+    async def scenario() -> None:
+        result = await with_timeout.execute("slow", "{}", ToolContext("s", "."))
+        assert result.is_error
+        assert result.meta == {"code": "TOOL_TIMEOUT"}
+        assert "timed out" in result.text
+
+    asyncio.run(scenario())
+    try:
+        ToolDefinition(
+            "invalid",
+            "invalid",
+            {"type": "object"},
+            slow,
+            timeout_seconds=inf,
+        )
+    except ValueError as exc:
+        assert "finite" in str(exc)
+    else:
+        raise AssertionError("non-finite tool timeouts must be rejected")

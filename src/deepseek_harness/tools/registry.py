@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
+from asyncio import wait_for
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -34,6 +36,13 @@ class ToolDefinition:
     description: str
     parameters: dict[str, Any]
     execute: ToolExecutor
+    timeout_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.timeout_seconds is not None and (
+            self.timeout_seconds <= 0 or not math.isfinite(self.timeout_seconds)
+        ):
+            raise ValueError("tool timeout_seconds must be finite and positive")
 
     def schema(self) -> ToolSchema:
         return ToolSchema(self.name, self.description, self.parameters)
@@ -82,10 +91,17 @@ class ToolRegistry:
         try:
             result = definition.execute(arguments, context)
             if inspect.isawaitable(result):
-                result = await result
+                if definition.timeout_seconds is None:
+                    result = await result
+                else:
+                    result = await wait_for(result, definition.timeout_seconds)
             if not isinstance(result, ToolResult):
                 raise TypeError("tool executor must return ToolResult")
             return result
+        except TimeoutError:
+            timeout = definition.timeout_seconds
+            rendered = f"tool {name} timed out after {timeout:g}s"
+            return ToolResult(rendered, is_error=True, meta={"code": "TOOL_TIMEOUT"})
         except Exception as exc:
             code = getattr(exc, "code", None)
             return ToolResult(

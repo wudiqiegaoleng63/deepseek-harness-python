@@ -437,10 +437,17 @@ def install_web_tools(
     *,
     max_results: int = DEFAULT_SEARCH_MAX_RESULTS,
     max_output_chars: int = DEFAULT_FETCH_MAX_OUTPUT_CHARS,
+    search_timeout_seconds: float = 60.0,
+    fetch_timeout_seconds: float = DEFAULT_FETCH_TIMEOUT_SECONDS,
 ) -> list[Callable[[], None]]:
     """Install the DSH ``web_search`` and ``web_fetch`` model tools."""
 
-    if max_results <= 0 or max_output_chars <= 0:
+    if (
+        max_results <= 0
+        or max_output_chars <= 0
+        or search_timeout_seconds <= 0
+        or fetch_timeout_seconds <= 0
+    ):
         raise ValueError("web tool limits must be positive")
 
     async def search(args: dict[str, Any], _context: ToolContext) -> ToolResult:
@@ -483,6 +490,7 @@ def install_web_tools(
                     "additionalProperties": False,
                 },
                 execute=search,
+                timeout_seconds=search_timeout_seconds,
             )
         ),
         registry.register(
@@ -496,6 +504,7 @@ def install_web_tools(
                     "additionalProperties": False,
                 },
                 execute=fetch,
+                timeout_seconds=fetch_timeout_seconds,
             )
         ),
     ]
