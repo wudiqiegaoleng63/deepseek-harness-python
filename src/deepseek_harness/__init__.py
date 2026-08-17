@@ -6,6 +6,13 @@ on the same Session and Agent contracts.
 """
 
 from .agent import Agent, AgentStatus, RunResult
+from .compaction import (
+    CompactionPolicy,
+    CompactionResult,
+    compact_if_needed,
+    estimate_message_tokens,
+    estimate_messages_tokens,
+)
 from .errors import LlmFailure
 from .llm import DeepSeekAdapter, LlmAdapter, LlmCallConfig, LlmRequest, RetryPolicy, StreamChunk
 from .models import Message, TextContent, ToolCallContent, ToolResultContent
@@ -24,6 +31,8 @@ from .session import JsonlSessionStore, Session, SessionEvent, SessionHeader
 __all__ = [
     "Agent",
     "AgentStatus",
+    "CompactionPolicy",
+    "CompactionResult",
     "DeepSeekAdapter",
     "DeepSeekHarness",
     "DeepSeekHarnessConfig",
@@ -49,4 +58,7 @@ __all__ = [
     "TextContent",
     "ToolCallContent",
     "ToolResultContent",
+    "compact_if_needed",
+    "estimate_message_tokens",
+    "estimate_messages_tokens",
 ]

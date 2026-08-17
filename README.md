@@ -17,6 +17,8 @@ The native Python host now contains:
 - a DeepSeek chat-completions SSE adapter with thinking/reasoning controls;
 - structured provider failures with bounded exponential retry and durable
   `llm/retry` lifecycle events for transient outages;
+- configurable context-window protection with deterministic local checkpoints,
+  balanced tool boundaries, and durable `compaction/*` events;
 - append-only Session events with atomic JSONL persistence, forked sessions, and
   durable one-shot/continuable subagents;
 - an Agent loop with tool-call continuation, cancellation, and queued prompts;
@@ -80,6 +82,31 @@ with DeepSeekHarness(
 
 print(result.final_response)
 ```
+
+Long-lived sessions compact their oldest complete message span when the
+configured pressure threshold is reached. The original JSONL events remain
+available for audit and replay, while the next model request sees the bounded
+checkpoint plus the recent tail. Configure the policy explicitly when embedding
+the runtime:
+
+```python
+from deepseek_harness import CompactionPolicy, DeepSeekHarness, DeepSeekHarnessConfig
+
+config = DeepSeekHarnessConfig(
+    compaction_policy=CompactionPolicy(
+        context_window_tokens=131_072,
+        threshold_ratio=0.8,
+        retain_ratio=0.16,
+    )
+)
+with DeepSeekHarness(config) as harness:
+    result = harness.run("Continue the task in this durable session.", session_id="demo")
+```
+
+The first backend uses a deterministic local checkpoint and does not spend an
+additional model call on summarization. Its public `CompactionPolicy` and
+durable event seam are intentionally compatible with adding a provider-backed
+summarizer later.
 
 For an isolated child process, use the compatible SDK runtime over newline-
 delimited JSON-RPC. The low-level protocol supports `initialize`,

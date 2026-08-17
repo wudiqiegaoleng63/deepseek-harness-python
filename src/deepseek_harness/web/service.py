@@ -20,6 +20,7 @@ import httpx
 from ..agent import Agent
 from ..agent_presets import AgentPresetError, AgentPresetRegistry
 from ..attachments import IMAGE_MEDIA_TYPES, AttachmentError, AttachmentStore, ImageAttachment
+from ..compaction import CompactionPolicy
 from ..dynamic_cordis import DynamicCordisService, install_dynamic_tools
 from ..errors import HarnessError
 from ..goals import GoalError, GoalManager
@@ -154,6 +155,7 @@ class HarnessService:
         permission_mode: PermissionMode = PermissionMode.WORKSPACE_WRITE,
         adapter_factory: AdapterFactory | None = None,
         retry_policy: RetryPolicy | None = None,
+        compaction_policy: CompactionPolicy | None = None,
     ) -> None:
         self.store = JsonlSessionStore(session_root)
         state_root = self.store.root
@@ -161,6 +163,7 @@ class HarnessService:
         self.model = model
         self.permission_mode = permission_mode
         self.retry_policy = retry_policy
+        self.compaction_policy = compaction_policy
         self.attachments = AttachmentStore(state_root)
         self.presets = AgentPresetRegistry(state_root)
         self.goals = GoalManager()
@@ -3556,6 +3559,7 @@ class HarnessService:
             ),
             system_prompt=system_prompt,
             retry_policy=self.retry_policy,
+            compaction_policy=self.compaction_policy,
         )
         handle = SessionHandle(session, agent, disposers)
         agent.subscribe(lambda event: self._publish_event(session.id, event))

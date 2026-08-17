@@ -170,21 +170,52 @@ class Session:
 
     def derive_messages(self) -> tuple[Message, ...]:
         messages: list[Message] = []
+        active_compaction_id: str | None = None
         for event in self._events:
+            if event.type == "compaction/summary":
+                # A compaction summary is a durable surface replacement.  Keep
+                # the checkpoint immediately so a partially written/replayed
+                # log still has a useful bounded projection; the following
+                # user/message event carries the same checkpoint in the normal
+                # completed transaction and replaces this fallback exactly.
+                active_compaction_id = _string_value(event.data.get("compactionId"))
+                raw_checkpoint = event.data.get("message")
+                checkpoint = _message_from_raw(raw_checkpoint, self._attachment_data)
+                raw_shadowed_ids = event.data.get("shadowedMessageIds")
+                shadowed_ids = (
+                    {item for item in raw_shadowed_ids if isinstance(item, str)}
+                    if isinstance(raw_shadowed_ids, list)
+                    else None
+                )
+                retained = (
+                    [message for message in messages if message.id not in shadowed_ids]
+                    if shadowed_ids is not None
+                    else []
+                )
+                messages = ([checkpoint] if checkpoint is not None else []) + retained
+                continue
             if event.type in {"user/message", "assistant/message", "tool/result"}:
                 raw = event.data.get("message")
                 if isinstance(raw, dict):
-                    message = message_from_dict(raw)
-                    content = tuple(
-                        ImageContent(
-                            block.attachment,
-                            self._attachment_data.get(str(block.attachment.get("attachmentId"))),
-                        )
-                        if isinstance(block, ImageContent)
-                        else block
-                        for block in message.content
-                    )
-                    messages.append(Message(message.role, content, message.source, message.id))
+                    message = _message_from_raw(raw, self._attachment_data)
+                    if message is None:
+                        continue
+                    if (
+                        event.type == "user/message"
+                        and active_compaction_id is not None
+                        and _is_compaction_checkpoint(message, active_compaction_id)
+                    ):
+                        if messages and _is_compaction_checkpoint(
+                            messages[0], active_compaction_id
+                        ):
+                            messages[0] = message
+                        else:
+                            messages = [message, *messages]
+                        active_compaction_id = None
+                    else:
+                        messages.append(message)
+                        if event.type == "user/message":
+                            active_compaction_id = None
         return tuple(messages)
 
     def register_attachment_data(self, attachment_id: str, data: str) -> None:
@@ -223,3 +254,33 @@ class Session:
         for expected, event in enumerate(self._events):
             if event.seq != expected:
                 raise ValueError(f"session event sequence is not contiguous at {expected}")
+
+
+def _string_value(value: JsonValue | None) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _message_from_raw(
+    raw: JsonValue | None,
+    attachment_data: dict[str, str],
+) -> Message | None:
+    if not isinstance(raw, dict):
+        return None
+    message = message_from_dict(raw)
+    content = tuple(
+        ImageContent(
+            block.attachment,
+            attachment_data.get(str(block.attachment.get("attachmentId"))),
+        )
+        if isinstance(block, ImageContent)
+        else block
+        for block in message.content
+    )
+    return Message(message.role, content, message.source, message.id)
+
+
+def _is_compaction_checkpoint(message: Message, compaction_id: str) -> bool:
+    return (
+        message.source.get("kind") == "compaction"
+        and message.source.get("compactionId") == compaction_id
+    )

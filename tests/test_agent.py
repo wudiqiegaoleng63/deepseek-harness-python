@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 import pytest
 
 from deepseek_harness.agent import Agent
+from deepseek_harness.compaction import CompactionPolicy
 from deepseek_harness.errors import ConfigurationError, LlmError
 from deepseek_harness.llm.types import LlmRequest, RetryPolicy, StreamChunk
 from deepseek_harness.session import Session
@@ -154,3 +155,62 @@ def test_retry_policy_validates_and_honors_provider_delay() -> None:
     policy = RetryPolicy(initial_delay_seconds=0.5, max_delay_seconds=2, jitter_ratio=0)
     assert policy.delay_seconds(1, retry_after_ms=1250) == 1.25
     assert policy.delay_seconds(3, random_value=0) == 2
+
+
+class RecordingAdapter:
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, ...]] = []
+
+    async def stream(self, request: LlmRequest) -> AsyncIterator[StreamChunk]:
+        self.requests.append(tuple(message.text for message in request.messages))
+        yield StreamChunk(kind="text", text="ack")
+        yield StreamChunk(kind="done", finish_reason="stop")
+
+    async def aclose(self) -> None:
+        return None
+
+
+def test_agent_compacts_long_history_with_durable_checkpoint() -> None:
+    async def scenario() -> None:
+        session = Session("session-compaction")
+        adapter = RecordingAdapter()
+        agent = Agent(
+            session,
+            adapter,
+            compaction_policy=CompactionPolicy(
+                context_window_tokens=300,
+                threshold_ratio=0.6,
+                retain_ratio=None,
+                retain_tokens=70,
+                summary_max_chars=300,
+            ),
+        )
+
+        for index in range(3):
+            await agent.run(f"request-{index}: " + ("context " * 90))
+
+        event_types = [event.type for event in session.events]
+        assert event_types.count("compaction/start") >= 1
+        assert event_types.count("compaction/summary") == event_types.count("compaction/end")
+        for summary_index, event_type in enumerate(event_types):
+            if event_type != "compaction/summary":
+                continue
+            assert event_types[summary_index : summary_index + 3] == [
+                "compaction/summary",
+                "user/message",
+                "compaction/end",
+            ]
+
+        projected = session.derive_messages()
+        checkpoints = [
+            message for message in projected if message.source.get("kind") == "compaction"
+        ]
+        assert len(checkpoints) == 1
+        assert "<compacted-summary>" in checkpoints[0].text
+        assert "request-0" in checkpoints[0].text
+        assert len(projected) < 7
+        assert any("request-2" in request for request in adapter.requests[-1])
+
+        await agent.dispose()
+
+    asyncio.run(scenario())

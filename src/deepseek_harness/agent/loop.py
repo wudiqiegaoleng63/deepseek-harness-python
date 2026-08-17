@@ -9,6 +9,11 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from ..compaction import (
+    CompactionPolicy,
+    compact_if_needed,
+    estimate_request_overhead,
+)
 from ..errors import ConfigurationError, LlmError, LlmFailure
 from ..llm.adapter import LlmAdapter
 from ..llm.types import LlmCallConfig, LlmRequest, RetryPolicy, StreamChunk
@@ -56,6 +61,7 @@ class Agent:
         system_prompt: str | Callable[[], str] | None = None,
         max_steps: int = 64,
         retry_policy: RetryPolicy | None = None,
+        compaction_policy: CompactionPolicy | None = None,
     ) -> None:
         self.session = session
         self.llm = llm
@@ -64,6 +70,7 @@ class Agent:
         self.system_prompt = system_prompt
         self.max_steps = max_steps
         self.retry_policy = retry_policy or RetryPolicy()
+        self.compaction_policy = compaction_policy or CompactionPolicy()
         self.status: AgentStatus = "idle"
         self._listeners: list[EventListener] = []
         self._run_lock = asyncio.Lock()
@@ -128,6 +135,20 @@ class Agent:
         try:
             for step in range(1, self.max_steps + 1):
                 await self._append("step/start", {"turn": turn, "step": step})
+                system = self._resolved_system_prompt()
+                tools = self.tools.schemas()
+                await compact_if_needed(
+                    self.session,
+                    self.compaction_policy,
+                    self._append,
+                    overhead_tokens=estimate_request_overhead(
+                        system,
+                        tools,
+                        chars_per_token=self.compaction_policy.chars_per_token,
+                    ),
+                    trigger="pressure",
+                    turn=turn,
+                )
                 retry = 0
                 while True:
                     text_parts: list[str] = []
@@ -137,8 +158,8 @@ class Agent:
                     request = LlmRequest(
                         messages=self.session.derive_messages(),
                         config=self.config,
-                        system=self._resolved_system_prompt(),
-                        tools=self.tools.schemas(),
+                        system=system,
+                        tools=tools,
                     )
                     try:
                         async for chunk in self.llm.stream(request):

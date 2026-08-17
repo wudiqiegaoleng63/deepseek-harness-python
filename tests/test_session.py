@@ -29,3 +29,32 @@ def test_session_projects_model_history_and_round_trips_jsonl(tmp_path) -> None:
         assert await store.list_ids() == (session.id,)
 
     asyncio.run(scenario())
+
+
+def test_session_replays_compaction_checkpoint_as_surface_replacement() -> None:
+    session = Session("session-compaction-replay")
+    old = create_user_message("old context")
+    checkpoint = Message(
+        "user",
+        (TextContent("<compacted-summary>old context</compacted-summary>"),),
+        {"kind": "compaction", "compactionId": "c-1"},
+    )
+    current = create_user_message("new context")
+    session.append("user/message", {"message": old.to_dict()})
+    session.append(
+        "compaction/summary",
+        {"compactionId": "c-1", "message": checkpoint.to_dict(), "summary": "old context"},
+    )
+    session.append(
+        "user/message",
+        {
+            "message": checkpoint.to_dict(),
+            "surfaceOp": {"op": "replace", "compactionId": "c-1"},
+        },
+    )
+    session.append("user/message", {"message": current.to_dict()})
+
+    assert [message.text for message in session.derive_messages()] == [
+        "<compacted-summary>old context</compacted-summary>",
+        "new context",
+    ]
