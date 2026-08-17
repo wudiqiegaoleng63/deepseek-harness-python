@@ -21,7 +21,7 @@ from ..agent import Agent
 from ..agent_presets import AgentPresetError, AgentPresetRegistry
 from ..attachments import IMAGE_MEDIA_TYPES, AttachmentError, AttachmentStore, ImageAttachment
 from ..checkpoint import SessionCheckpointPolicy
-from ..compaction import CompactionPolicy
+from ..compaction import CompactionPolicy, ManualCompactionError
 from ..dynamic_cordis import DynamicCordisService, install_dynamic_tools
 from ..errors import HarnessError
 from ..goals import GoalError, GoalManager
@@ -571,16 +571,94 @@ class HarnessService:
         await self.store.save(handle.session)
         return {"accepted": True, "command": {"kind": kind, "text": text}}
 
+    async def _execute_compact_command(
+        self,
+        handle: SessionHandle,
+        args: str,
+    ) -> JsonObject:
+        """Execute the TS-compatible argument-free ``/compact`` command."""
+
+        command_id = f"cmd-{uuid.uuid4().hex}"
+        run = handle.session.append(
+            "command/run",
+            {
+                "commandId": command_id,
+                "name": "compact",
+                "args": args,
+                "source": {"kind": "user"},
+            },
+        )
+        self._publish_event(handle.session.id, run)
+
+        kind = "success"
+        text: str
+        source_event_seq: int | None = None
+        if args.strip():
+            kind = "error"
+            text = "Usage: /compact (no arguments)"
+        else:
+            try:
+                result = await handle.agent.compact_now()
+            except ManualCompactionError as exc:
+                kind = "error"
+                text = {
+                    "busy": (
+                        "Compaction is unavailable because this process has an active "
+                        "compaction, or the agent is not idle."
+                    ),
+                    "cancelled": "Compaction cancelled.",
+                    "changed": (
+                        "The history selected for compaction changed before it could be "
+                        "replaced. The conversation is unchanged; the attempt is recorded "
+                        "in the session log."
+                    ),
+                    "summary": (
+                        "Compaction could not produce a useful summary. The conversation is "
+                        "unchanged; the attempt is recorded in the session log."
+                    ),
+                    "commit": (
+                        "Compaction did not finish cleanly; some session history may have "
+                        "changed. Inspect the current session state before retrying."
+                    ),
+                    "persistence": "Compaction finished, but the session could not be saved.",
+                }.get(exc.code, str(exc))
+            else:
+                if result is None:
+                    text = "No compactable history yet."
+                else:
+                    source_event_seq = result.summary_seq
+                    text = (
+                        f"Compacted {result.replaced_message_count} history items "
+                        f"(~{result.replaced_token_count} tokens)."
+                    )
+
+        done_data: JsonObject = {
+            "commandId": command_id,
+            "kind": kind,
+            "text": text,
+        }
+        if source_event_seq is not None:
+            done_data["sourceEventSeq"] = source_event_seq
+        done = handle.session.append("command/done", done_data)
+        self._publish_event(handle.session.id, done)
+        await self.store.save(handle.session)
+        command: JsonObject = {"kind": kind, "text": text}
+        if source_event_seq is not None:
+            command["sourceEventSeq"] = source_event_seq
+        return {"accepted": True, "command": command}
+
     async def _execute_command(self, handle: SessionHandle, line: str) -> JsonObject:
         """Execute the small host command surface needed by the shared UI."""
 
         body = line.lstrip()[1:]
         name, separator, raw_args = body.partition(" ")
-        if name not in {"plan", "permission"}:
+        if name not in {"plan", "permission", "compact"}:
             raise ApiFault("unknown-command", f"unknown command: /{name}")
         args = raw_args if separator else ""
         if name == "permission":
             return await self._execute_permission_command(handle, args)
+        if name == "compact":
+            return await self._execute_compact_command(handle, args)
         target = args.strip() != "off"
         command_id = f"cmd-{uuid.uuid4().hex}"
         run = handle.session.append(
@@ -3858,6 +3936,7 @@ class HarnessService:
             self._sync_live_permission(handle)
             self._publish_permission_projection(handle)
         if event.type in {
+            "user/message",
             "assistant/chunk",
             "assistant/message",
             "request/header",
@@ -3867,6 +3946,10 @@ class HarnessService:
             "step/start",
             "step/end",
             "turn/end",
+            "compaction/start",
+            "compaction/summary",
+            "compaction/end",
+            "compaction/prune",
         }:
             self._publish_metric_projections(handle, event.seq)
         if event.type == "session/title":

@@ -21,6 +21,8 @@ The native Python host now contains:
   `llm/retry` lifecycle events for transient outages;
 - configurable context-window protection with deterministic local checkpoints,
   balanced tool boundaries, and durable `compaction/*` events;
+- argument-free `/compact` manual compaction with command lifecycle records and
+  summary accounting;
 - model-free tool-result pruning with replay-safe head/middle/tail replacements;
 - session-scoped private spill files with bounded previews for oversized results;
 - deterministic, durable session titles with control-code sanitization and rename pinning;

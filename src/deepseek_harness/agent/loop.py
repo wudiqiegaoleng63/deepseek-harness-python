@@ -12,6 +12,8 @@ from typing import Any, Literal, cast
 from ..checkpoint import SessionCheckpointPolicy
 from ..compaction import (
     CompactionPolicy,
+    CompactionResult,
+    ManualCompactionError,
     compact_if_needed,
     estimate_request_overhead,
 )
@@ -27,6 +29,7 @@ from ..models import (
     create_tool_message,
     create_user_message,
 )
+from ..plans import has_open_turn
 from ..session import Session, SessionEvent
 from ..tool_result_pruner import ToolResultPruner
 from ..tools.registry import ToolContext, ToolRegistry
@@ -113,6 +116,51 @@ class Agent:
             first_seq = self.session.seq
             try:
                 return await self._run_turn(prompt, first_seq)
+            finally:
+                self.status = "idle"
+                self._idle.set()
+
+    async def compact_now(self) -> CompactionResult | None:
+        """Run one idle-session compaction with durable manual provenance.
+
+        The normal turn driver owns the same lock, so an active turn is never
+        compacted concurrently.  The public status check makes the command
+        fail fast while a model/tool turn is already in progress.
+        """
+
+        if self._disposed:
+            raise RuntimeError("agent is disposed")
+        if self.status != "idle" or self._run_lock.locked() or has_open_turn(self.session):
+            raise ManualCompactionError(
+                "busy",
+                "manual compaction requires an idle session without an open turn",
+            )
+        async with self._run_lock:
+            if self.status != "idle" or has_open_turn(self.session):
+                raise ManualCompactionError(
+                    "busy",
+                    "manual compaction requires an idle session without an open turn",
+                )
+            self._idle.clear()
+            self.status = "running"
+            try:
+                system = self._resolved_system_prompt()
+                tools = self.tools.schemas()
+                return await compact_if_needed(
+                    self.session,
+                    self.compaction_policy,
+                    self._append,
+                    overhead_tokens=estimate_request_overhead(
+                        system,
+                        tools,
+                        chars_per_token=self.compaction_policy.chars_per_token,
+                    ),
+                    trigger="manual",
+                    turn=None,
+                    pruner=self.tool_result_pruner,
+                )
+            except asyncio.CancelledError as exc:
+                raise ManualCompactionError("cancelled", "manual compaction was cancelled") from exc
             finally:
                 self.status = "idle"
                 self._idle.set()

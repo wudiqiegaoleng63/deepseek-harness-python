@@ -10,6 +10,7 @@ from .checkpoint import CheckpointCallback, SessionCheckpointPolicy
 from .compaction import (
     CompactionPolicy,
     CompactionResult,
+    ManualCompactionError,
     compact_if_needed,
     estimate_message_tokens,
     estimate_messages_tokens,
@@ -139,6 +140,7 @@ __all__ = [
     "CheckpointCallback",
     "CompactionPolicy",
     "CompactionResult",
+    "ManualCompactionError",
     "context_breakdown_projection",
     "context_pressure_projection",
     "CUSTOM_PERMISSION_PRESET",

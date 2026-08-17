@@ -35,6 +35,9 @@ if TYPE_CHECKING:
     from .tool_result_pruner import ToolResultPruner
 
 CompactionTrigger = Literal["pressure", "context-overflow", "manual"]
+ManualCompactionErrorCode = Literal[
+    "busy", "cancelled", "changed", "summary", "commit", "persistence"
+]
 CompactionAppender = Callable[[str, dict[str, JsonValue]], Awaitable[SessionEvent]]
 
 CHECKPOINT_PREFIX = (
@@ -43,6 +46,14 @@ CHECKPOINT_PREFIX = (
     "background and build on it without restating it. Continue the task directly from "
     "the messages that follow, without acknowledging this checkpoint."
 )
+
+
+class ManualCompactionError(RuntimeError):
+    """An expected failure from an argument-free manual compaction request."""
+
+    def __init__(self, code: ManualCompactionErrorCode, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +129,7 @@ class CompactionResult:
     end_seq: int
     replaced_message_count: int
     retained_message_count: int
+    replaced_token_count: int
     estimated_tokens_before: int
     estimated_tokens_after: int
 
@@ -285,6 +297,9 @@ async def compact_if_needed(
         end_seq=end_event.seq,
         replaced_message_count=len(replaced),
         retained_message_count=len(retained),
+        replaced_token_count=estimate_messages_tokens(
+            replaced, chars_per_token=policy.chars_per_token
+        ),
         estimated_tokens_before=estimated_before,
         estimated_tokens_after=estimated_after,
     )
@@ -382,6 +397,8 @@ def _frame_checkpoint(summary: str) -> str:
 
 __all__ = [
     "CHECKPOINT_PREFIX",
+    "ManualCompactionError",
+    "ManualCompactionErrorCode",
     "CompactionPolicy",
     "CompactionResult",
     "CompactionTrigger",
