@@ -43,6 +43,13 @@ from .lsp import (
     parse_lsp_args,
     render_uri,
 )
+from .lsp_stdio import (
+    LspStdioProvider,
+    LspStdioServerConfig,
+    install_lsp_stdio_providers,
+    normalize_hover,
+    normalize_locations,
+)
 from .models import Message, TextContent, ToolCallContent, ToolResultContent
 from .sdk import DeepSeekHarness, DeepSeekHarnessConfig
 from .sdk import RunResult as SdkRunResult
@@ -135,6 +142,8 @@ __all__ = [
     "LspRange",
     "LspRuntime",
     "LspToolInput",
+    "LspStdioProvider",
+    "LspStdioServerConfig",
     "LlmRequest",
     "Message",
     "NotificationSubscription",
@@ -207,4 +216,7 @@ __all__ = [
     "SESSION_TITLE_TIMEOUT_CODE",
     "TITLE_PROVIDER_ID",
     "generate_session_title",
+    "install_lsp_stdio_providers",
+    "normalize_hover",
+    "normalize_locations",
 ]

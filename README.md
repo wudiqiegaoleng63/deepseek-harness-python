@@ -26,6 +26,8 @@ The native Python host now contains:
 - deterministic, durable session titles with control-code sanitization and rename pinning;
 - optional first-prompt model title generation with bounded input/output, timeout, and a
   deterministic fallback when the auxiliary call fails;
+- optional stdio LSP providers with workspace-bounded transient document queries and
+  JSON-RPC lifecycle management;
 - append-only Session events with atomic JSONL persistence, forked sessions, and
   durable one-shot/continuable subagents;
 - an Agent loop with tool-call continuation, cancellation, and queued prompts;
