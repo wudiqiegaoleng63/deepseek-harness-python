@@ -15,6 +15,8 @@ The native Python host now contains:
 - reversible hierarchical plugin contexts and serial/waterfall events;
 - provider-neutral messages, tool schemas, and stream chunks;
 - a DeepSeek chat-completions SSE adapter with thinking/reasoning controls;
+- provider-neutral `web_search` and `web_fetch` tools, including bounded
+  same-origin HTTP retrieval and DeepSeek native search citations;
 - structured provider failures with bounded exponential retry and durable
   `llm/retry` lifecycle events for transient outages;
 - configurable context-window protection with deterministic local checkpoints,
@@ -69,6 +71,14 @@ Both `headless` and `serve` use the same full Harness service runtime. Use
 `--base-url`, `--api-key`, and `--request-timeout` for a DeepSeek-compatible
 endpoint; the corresponding `DEEPSEEK_BASE_URL` and `DEEPSEEK_API_KEY`
 environment variables are supported as well.
+
+The web tools are available to the model by default. `web_fetch` uses an
+anonymous HTTP(S) provider with response, redirect, timeout, and output caps.
+`web_search` uses the Anthropic-compatible DeepSeek search endpoint when
+`DEEPSEEK_API_KEY` (or the configured credential reference) is available. Set
+`DEEPSEEK_SEARCH_BASE_URL` or update the `web-search-deepseek` settings namespace
+for a compatible endpoint; search and chat-completions intentionally keep
+separate base URLs.
 
 Use the same runtime from Python:
 

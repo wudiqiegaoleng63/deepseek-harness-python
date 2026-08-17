@@ -13,7 +13,7 @@ from .compaction import (
     estimate_message_tokens,
     estimate_messages_tokens,
 )
-from .errors import LlmFailure
+from .errors import LlmFailure, WebError
 from .llm import DeepSeekAdapter, LlmAdapter, LlmCallConfig, LlmRequest, RetryPolicy, StreamChunk
 from .models import Message, TextContent, ToolCallContent, ToolResultContent
 from .sdk import DeepSeekHarness, DeepSeekHarnessConfig
@@ -27,6 +27,20 @@ from .sdk_process import (
     ProcessSession,
 )
 from .session import JsonlSessionStore, Session, SessionEvent, SessionHeader
+from .web_capability import (
+    DeepSeekSearchOptions,
+    DeepSeekSearchProvider,
+    HttpFetchLimits,
+    HttpFetchProvider,
+    WebFetchBody,
+    WebFetchResult,
+    WebRuntime,
+    WebSearchResult,
+    WebSource,
+    format_fetch_output,
+    format_search_output,
+    install_web_tools,
+)
 
 __all__ = [
     "Agent",
@@ -58,7 +72,20 @@ __all__ = [
     "TextContent",
     "ToolCallContent",
     "ToolResultContent",
+    "WebError",
+    "WebFetchBody",
+    "WebFetchResult",
+    "WebRuntime",
+    "WebSearchResult",
+    "WebSource",
     "compact_if_needed",
     "estimate_message_tokens",
     "estimate_messages_tokens",
+    "DeepSeekSearchOptions",
+    "DeepSeekSearchProvider",
+    "HttpFetchLimits",
+    "HttpFetchProvider",
+    "format_fetch_output",
+    "format_search_output",
+    "install_web_tools",
 ]

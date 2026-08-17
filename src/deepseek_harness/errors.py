@@ -59,6 +59,21 @@ class ToolError(HarnessError):
     """Raised when a model-facing tool cannot be executed."""
 
 
+class WebError(HarnessError):
+    """Raised when a web provider cannot safely complete a search or fetch."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "WEB_PROVIDER_ERROR",
+        status: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+
 @dataclass(frozen=True, slots=True)
 class LlmFailure:
     """Provider-neutral facts used by retry and terminal event policy."""

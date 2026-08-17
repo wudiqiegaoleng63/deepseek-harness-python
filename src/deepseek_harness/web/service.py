@@ -43,6 +43,17 @@ from ..skills import SkillRegistry
 from ..todos import TodoError, TodoManager
 from ..tools import PermissionMode, WorkspacePolicy, install_builtin_tools
 from ..tools.registry import ToolContext, ToolDefinition, ToolRegistry, ToolResult
+from ..web_capability import (
+    DEFAULT_SEARCH_BASE_URL,
+    DEFAULT_SEARCH_MAX_TOKENS,
+    DEFAULT_SEARCH_MAX_USES,
+    DEFAULT_SEARCH_MODEL,
+    DeepSeekSearchOptions,
+    DeepSeekSearchProvider,
+    HttpFetchProvider,
+    WebRuntime,
+    install_web_tools,
+)
 from ..workflow import (
     WorkflowChildResult,
     WorkflowError,
@@ -245,8 +256,25 @@ class HarnessService:
         )
         self.settings.register("shell", schema={"type": "object"}, base={})
         self.settings.register("agent-loop", schema={"type": "object"}, base={})
-        self.settings.register("web-search-deepseek", schema={"type": "object"}, base={})
+        self.settings.register(
+            "web-search-deepseek",
+            schema={"type": "object"},
+            base={
+                "apiKeyEnv": "DEEPSEEK_API_KEY",
+                "baseURL": os.getenv("DEEPSEEK_SEARCH_BASE_URL") or DEFAULT_SEARCH_BASE_URL,
+                "model": DEFAULT_SEARCH_MODEL,
+                "apiVersion": "2023-06-01",
+                "maxTokens": DEFAULT_SEARCH_MAX_TOKENS,
+                "maxUses": DEFAULT_SEARCH_MAX_USES,
+            },
+        )
         self.credentials = CredentialStore(state_root)
+        self.web = WebRuntime(
+            search_provider_id=os.getenv("DSH_WEB_SEARCH_PROVIDER"),
+            fetch_provider_id=os.getenv("DSH_WEB_FETCH_PROVIDER"),
+        )
+        self.web.register_fetch_provider(HttpFetchProvider())
+        self.web.register_search_provider(DeepSeekSearchProvider(self._deepseek_search_options))
         self.workspaces = WorkspaceRegistry(state_root)
         self.skills = SkillRegistry()
         self._adapter_factory = adapter_factory or self._default_adapter
@@ -3510,6 +3538,7 @@ class HarnessService:
         disposers.extend(self._install_todo_tool(registry, session))
         disposers.extend(self._install_subagent_tools(registry, session))
         disposers.extend(install_dynamic_tools(registry, self.dynamic, session.id))
+        disposers.extend(install_web_tools(registry, self.web))
         selection = session.header.model_selection or self._default_selection()
         provider = selection.get("provider")
         selected_model = selection.get("model")
@@ -3575,6 +3604,33 @@ class HarnessService:
         configured_url = config.get("baseURL")
         base_url = configured_url if isinstance(configured_url, str) else None
         return DeepSeekAdapter(api_key=api_key, base_url=base_url, timeout=120.0)
+
+    def _deepseek_search_options(self) -> DeepSeekSearchOptions:
+        settings = self.settings.get_value_sync("web-search-deepseek")
+        api_key_ref = settings.get("apiKeyEnv", "DEEPSEEK_API_KEY")
+        api_key = None
+        if isinstance(api_key_ref, str):
+            try:
+                api_key = self.credentials.resolve_sync(api_key_ref)
+            except ValueError:
+                api_key = None
+        base_url = settings.get("baseURL")
+        model = settings.get("model")
+        api_version = settings.get("apiVersion")
+        max_tokens = settings.get("maxTokens")
+        max_uses = settings.get("maxUses")
+        return DeepSeekSearchOptions(
+            api_key=api_key,
+            base_url=base_url if isinstance(base_url, str) else DEFAULT_SEARCH_BASE_URL,
+            model=model if isinstance(model, str) else DEFAULT_SEARCH_MODEL,
+            api_version=api_version if isinstance(api_version, str) else "2023-06-01",
+            max_tokens=max_tokens
+            if isinstance(max_tokens, int) and max_tokens > 0
+            else DEFAULT_SEARCH_MAX_TOKENS,
+            max_uses=max_uses
+            if isinstance(max_uses, int) and max_uses > 0
+            else DEFAULT_SEARCH_MAX_USES,
+        )
 
     def _effective_permission_mode(self) -> PermissionMode:
         value = self.settings.get_value_sync("permission").get("defaultPreset")
