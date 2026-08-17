@@ -51,6 +51,8 @@ The native Python host now contains:
 - event-sourced permission presets with the shared `permissions` projection,
   `/permission` and `permission.set`, replayable sandbox/approval knobs, and
   live shell registration only for `danger-full-access`;
+- durable request metadata plus replayable `tokenUsage`, `contextPressure`,
+  `contextBreakdown`, and `sessionStats` projections for the shared chat UI;
 - the UI-backed `ask_user_question` tool and pending question response flow;
 - `messageFeedback/list|put|delete` with lifecycle fencing, compare-and-set
   versions, note validation, and a durable JSON sidecar;

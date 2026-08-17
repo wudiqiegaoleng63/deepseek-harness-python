@@ -53,6 +53,8 @@ def test_agent_runs_tool_call_then_continues_model_turn() -> None:
             "turn/start",
             "user/message",
             "step/start",
+            "request/header",
+            "request/context",
             "assistant/chunk",
             "assistant/chunk",
             "assistant/message",

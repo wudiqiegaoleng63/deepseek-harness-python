@@ -30,6 +30,12 @@ from ..llm import DeepSeekAdapter, LlmCallConfig, RetryPolicy
 from ..llm.adapter import LlmAdapter
 from ..lsp import LspRuntime, install_lsp_tools
 from ..message_feedback import MessageFeedbackManager
+from ..metrics import (
+    context_breakdown_projection,
+    context_pressure_projection,
+    session_stats_projection,
+    token_usage_projection,
+)
 from ..models import ImageContent, Message, TextContent, message_from_dict
 from ..permissions import (
     ApprovalPolicy,
@@ -991,6 +997,14 @@ class HarnessService:
                         "value": self._permission_projection(handle.session),
                         "seq": max(0, handle.session.seq - 1),
                     }
+                    for key, value in self._metric_projections(handle).items():
+                        yield {
+                            "type": "session/projection",
+                            "sessionId": session_id,
+                            "key": key,
+                            "value": value,
+                            "seq": max(0, handle.session.seq - 1),
+                        }
                     for pending in tuple(self._pending_approvals.values()):
                         if pending.session_id == session_id:
                             yield pending.frame()
@@ -3843,6 +3857,18 @@ class HarnessService:
         if event.type in {"permission/preset", "sandbox/mode", "approval/policy"}:
             self._sync_live_permission(handle)
             self._publish_permission_projection(handle)
+        if event.type in {
+            "assistant/chunk",
+            "assistant/message",
+            "request/header",
+            "request/context",
+            "tool/call",
+            "tool/result",
+            "step/start",
+            "step/end",
+            "turn/end",
+        }:
+            self._publish_metric_projections(handle, event.seq)
         if event.type == "session/title":
             title = fold_session_title(handle.session)
             self._publish_mux(
@@ -4015,9 +4041,36 @@ class HarnessService:
             }
         )
 
+    def _publish_metric_projections(self, handle: SessionHandle, seq: int) -> None:
+        for key, value in self._metric_projections(handle).items():
+            self._publish_mux(
+                {
+                    "type": "session/projection",
+                    "sessionId": handle.session.id,
+                    "key": key,
+                    "value": value,
+                    "seq": seq,
+                }
+            )
+
+    def _metric_projections(self, handle: SessionHandle) -> dict[str, JsonObject]:
+        system_prompt = handle.agent.system_prompt
+        system = system_prompt() if callable(system_prompt) else system_prompt
+        tools = handle.agent.tools.schemas()
+        return {
+            "tokenUsage": token_usage_projection(handle.session.events),
+            "contextPressure": context_pressure_projection(handle.session.events),
+            "contextBreakdown": context_breakdown_projection(
+                handle.session.derive_messages(),
+                system=system,
+                tools=tools,
+            ),
+            "sessionStats": session_stats_projection(handle.session.events),
+        }
+
     def _projection_values(self, session: Session) -> JsonObject:
         title = fold_session_title(session)
-        return {
+        values: JsonObject = {
             "title": title.title if title is not None else None,
             "goal": self.goals.fold(session).projection(),
             "plan": fold_plan_mode(session).to_dict(),
@@ -4025,6 +4078,10 @@ class HarnessService:
             "imageLimits": self._image_limits(),
             "permissions": self._permission_projection(session),
         }
+        handle = self._handles.get(session.id)
+        if handle is not None:
+            values.update(self._metric_projections(handle))
+        return values
 
     def _image_limits(self) -> JsonObject:
         return {

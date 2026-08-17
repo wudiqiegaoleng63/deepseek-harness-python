@@ -198,6 +198,11 @@ class DeepSeekAdapter:
             finish = choice.get("finish_reason")
             if finish is not None:
                 chunks.append(StreamChunk(kind="done", finish_reason=str(finish), usage=usage))
+        # DeepSeek may send usage in a trailing SSE payload with no choices.
+        # Preserve it as a terminal-neutral chunk so the Agent can attach the
+        # sample to the durable assistant/message event.
+        if not chunks and isinstance(usage, dict):
+            chunks.append(StreamChunk(kind="done", usage=usage))
         return chunks
 
     @staticmethod

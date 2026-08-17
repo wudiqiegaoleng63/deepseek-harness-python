@@ -7,7 +7,7 @@ import inspect
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from ..checkpoint import SessionCheckpointPolicy
 from ..compaction import (
@@ -18,6 +18,7 @@ from ..compaction import (
 from ..errors import ConfigurationError, LlmError, LlmFailure
 from ..llm.adapter import LlmAdapter
 from ..llm.types import LlmCallConfig, LlmRequest, RetryPolicy, StreamChunk
+from ..metrics import normalize_usage
 from ..models import (
     JsonValue,
     Message,
@@ -161,6 +162,7 @@ class Agent:
                     text_parts: list[str] = []
                     reasoning_parts: list[str] = []
                     calls: dict[int, _ToolCallAccumulator] = {}
+                    usage: dict[str, int] | None = None
                     finish_reason = None
                     request = LlmRequest(
                         messages=self.session.derive_messages(),
@@ -170,11 +172,18 @@ class Agent:
                     )
                     if self.checkpoint_policy is not None:
                         await self.checkpoint_policy.before_model_request(self.session)
+                    await self._append_request_metadata(system, tools)
                     try:
                         async for chunk in self.llm.stream(request):
+                            chunk_data = chunk.to_dict()
+                            if chunk.usage is not None:
+                                normalized_usage = normalize_usage(chunk.usage)
+                                if normalized_usage is not None:
+                                    chunk_data["usage"] = normalized_usage
+                                    usage = normalized_usage
                             await self._append(
                                 "assistant/chunk",
-                                {"turn": turn, "step": step, "chunk": chunk.to_dict()},
+                                {"turn": turn, "step": step, "chunk": chunk_data},
                             )
                             self._consume_chunk(chunk, text_parts, reasoning_parts, calls)
                             if chunk.kind == "done" and chunk.finish_reason:
@@ -233,10 +242,14 @@ class Agent:
                     content=tuple(self._block_from_dict_or_value(block) for block in blocks),
                     source={"kind": "assistant"},
                 )
-                await self._append(
-                    "assistant/message",
-                    {"turn": turn, "step": step, "message": assistant.to_dict()},
-                )
+                assistant_data: dict[str, JsonValue] = {
+                    "turn": turn,
+                    "step": step,
+                    "message": assistant.to_dict(),
+                }
+                if usage is not None:
+                    assistant_data["usage"] = cast(JsonValue, usage)
+                await self._append("assistant/message", assistant_data)
                 await self._append("step/end", {"turn": turn, "step": step})
 
                 if calls:
@@ -314,6 +327,58 @@ class Agent:
             if chunk.name:
                 call.name = chunk.name
             call.arguments += chunk.arguments
+
+    async def _append_request_metadata(
+        self,
+        system: str | None,
+        tools: tuple[Any, ...],
+    ) -> None:
+        """Persist the request envelope and route capacity when they change."""
+
+        config: dict[str, JsonValue] = {
+            "provider": self.config.provider,
+            "model": self.config.model,
+        }
+        for key, value in (
+            ("maxTokens", self.config.max_tokens),
+            ("temperature", self.config.temperature),
+            ("topP", self.config.top_p),
+            ("thinking", self.config.thinking),
+            ("reasoningEffort", self.config.reasoning_effort),
+        ):
+            if value is not None:
+                config[key] = value
+        header: dict[str, JsonValue] = {"config": config}
+        if system is not None:
+            header["system"] = system
+        if tools:
+            header["tools"] = [tool.to_openai() for tool in tools]
+        previous_header: JsonValue | None = None
+        for event in reversed(self.session.events):
+            if event.type == "request/header":
+                previous_header = event.data.get("header")
+                break
+        if previous_header != header:
+            await self._append(
+                "request/header",
+                {
+                    "header": header,
+                    "reason": "initial" if previous_header is None else "change",
+                },
+            )
+
+        context: dict[str, JsonValue] = {
+            "provider": self.config.provider,
+            "model": self.config.model,
+            "contextWindow": self.compaction_policy.context_window_tokens,
+        }
+        previous_context: JsonValue | None = None
+        for event in reversed(self.session.events):
+            if event.type == "request/context":
+                previous_context = event.data
+                break
+        if previous_context != context:
+            await self._append("request/context", context)
 
     @staticmethod
     def _normalize_finish_reason(reason: str) -> str:
