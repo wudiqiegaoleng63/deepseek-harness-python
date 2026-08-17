@@ -31,6 +31,10 @@ from ..llm.adapter import LlmAdapter
 from ..lsp import LspRuntime, install_lsp_tools
 from ..message_feedback import MessageFeedbackManager
 from ..models import ImageContent, Message, TextContent, message_from_dict
+from ..permissions import (
+    ApprovalPolicy,
+    PermissionPresetManager,
+)
 from ..plans import fold as fold_plan_mode
 from ..plans import has_open_turn
 from ..session import JsonlSessionStore, Session, SessionEvent
@@ -54,7 +58,7 @@ from ..skills import SkillRegistry
 from ..spill import LocalSpillStore, SpillPolicy
 from ..todos import TodoError, TodoManager
 from ..tool_result_pruner import ToolResultPruner
-from ..tools import PermissionMode, WorkspacePolicy, install_builtin_tools
+from ..tools import PermissionMode, WorkspacePolicy, install_builtin_tools, install_shell_tools
 from ..tools.registry import ToolContext, ToolDefinition, ToolRegistry, ToolResult
 from ..web_capability import (
     DEFAULT_SEARCH_BASE_URL,
@@ -106,6 +110,8 @@ class SessionHandle:
     session: Session
     agent: Agent
     disposers: list[Callable[[], None]]
+    policy: WorkspacePolicy
+    shell_disposers: list[Callable[[], None]] = field(default_factory=list)
     task: asyncio.Task[Any] | None = None
     queue: list[QueueItem] = field(default_factory=list)
 
@@ -203,6 +209,7 @@ class HarnessService:
         self.todos = TodoManager(allow_parallel_in_progress=True)
         self.message_feedback = MessageFeedbackManager(state_root, max_note_bytes=8192)
         self.session_titles = SessionTitleService()
+        self.permissions = PermissionPresetManager()
         self.settings = SettingsRegistry(state_root)
         self.settings.register(
             "ui-onboarding",
@@ -516,14 +523,58 @@ class HarnessService:
         text = message.content[0].text
         return text if text.lstrip().startswith("/") else None
 
+    async def _execute_permission_command(
+        self,
+        handle: SessionHandle,
+        args: str,
+    ) -> JsonObject:
+        """Execute the shared UI's ``/permission`` command."""
+
+        command_id = f"cmd-{uuid.uuid4().hex}"
+        run = handle.session.append(
+            "command/run",
+            {
+                "commandId": command_id,
+                "name": "permission",
+                "args": args,
+                "source": {"kind": "user"},
+            },
+        )
+        self._publish_event(handle.session.id, run)
+        preset = args.strip()
+        if preset == "":
+            kind = "success"
+            text = (
+                f"current preset {self._permission_projection(handle.session)['currentValue']} "
+                f"(available: {', '.join(self.permissions.names)})"
+            )
+        else:
+            try:
+                self._append_permission_changes(handle, preset)
+            except ValueError as exc:
+                kind = "error"
+                text = str(exc)
+            else:
+                kind = "success"
+                text = f"preset {preset}"
+        done = handle.session.append(
+            "command/done",
+            {"commandId": command_id, "kind": kind, "text": text},
+        )
+        self._publish_event(handle.session.id, done)
+        await self.store.save(handle.session)
+        return {"accepted": True, "command": {"kind": kind, "text": text}}
+
     async def _execute_command(self, handle: SessionHandle, line: str) -> JsonObject:
         """Execute the small host command surface needed by the shared UI."""
 
         body = line.lstrip()[1:]
         name, separator, raw_args = body.partition(" ")
-        if name != "plan":
+        if name not in {"plan", "permission"}:
             raise ApiFault("unknown-command", f"unknown command: /{name}")
         args = raw_args if separator else ""
+        if name == "permission":
+            return await self._execute_permission_command(handle, args)
         target = args.strip() != "off"
         command_id = f"cmd-{uuid.uuid4().hex}"
         run = handle.session.append(
@@ -607,6 +658,12 @@ class HarnessService:
         await self.store.save(handle.session)
         self._publish_event(session_id, event)
         self._pending_approvals[rpc_id] = pending
+        if self._effective_approval_policy(handle.session) == "never":
+            # Match the TS approval seam: never means deterministic rejection
+            # before any answerer/UI is involved, while retaining the audit
+            # pair for replay and diagnostics.
+            await self._finish_approval(rpc_id, "rejected")
+            return "rejected"
         self._publish_mux(pending.frame())
         try:
             return await future
@@ -925,6 +982,13 @@ class HarnessService:
                         "sessionId": session_id,
                         "key": "imageLimits",
                         "value": self._image_limits(),
+                        "seq": max(0, handle.session.seq - 1),
+                    }
+                    yield {
+                        "type": "session/projection",
+                        "sessionId": session_id,
+                        "key": "permissions",
+                        "value": self._permission_projection(handle.session),
                         "seq": max(0, handle.session.seq - 1),
                     }
                     for pending in tuple(self._pending_approvals.values()):
@@ -1284,6 +1348,20 @@ class HarnessService:
             except CredentialError as exc:
                 raise ApiFault("credential-rejected", str(exc), {"ref": exc.ref}) from exc
             return {}
+        if method == "permission.set":
+            session_id = self._required_string(payload, "sessionId")
+            preset = self._required_string(payload, "preset")
+            handle = await self.get_session(session_id)
+            try:
+                self._append_permission_changes(handle, preset)
+            except ValueError as exc:
+                raise ApiFault(
+                    "permission-invalid",
+                    str(exc),
+                    {"preset": preset, "available": list(self.permissions.names)},
+                ) from exc
+            await self.store.save(handle.session)
+            return {"permissions": self._permission_projection(handle.session)}
         if method == "plan.set":
             session_id = self._required_string(payload, "sessionId")
             active = payload.get("active")
@@ -3546,7 +3624,7 @@ class HarnessService:
     def _attach(self, session: Session) -> SessionHandle:
         workspace = Path(session.header.cwd or self.cwd).expanduser().resolve()
         registry = ToolRegistry(result_transformer=self.spill_policy.transform)
-        permission_mode = self._effective_permission_mode()
+        permission_mode = self._effective_permission_mode(session)
         policy = WorkspacePolicy(
             workspace,
             permission_mode,
@@ -3555,9 +3633,16 @@ class HarnessService:
         disposers = install_builtin_tools(
             registry,
             policy,
-            enable_shell=permission_mode is PermissionMode.DANGER_FULL_ACCESS,
+            enable_shell=False,
             jobs=self.jobs,
         )
+        shell_disposers = self._set_shell_tools(
+            registry,
+            policy,
+            permission_mode,
+            jobs=self.jobs,
+        )
+        disposers.extend(shell_disposers)
         self._tool_registries[session.id] = registry
 
         def dispose_tool_registry() -> None:
@@ -3628,7 +3713,7 @@ class HarnessService:
             tool_result_pruner=self.tool_result_pruner,
             checkpoint_policy=SessionCheckpointPolicy(self.store.save),
         )
-        handle = SessionHandle(session, agent, disposers)
+        handle = SessionHandle(session, agent, disposers, policy, shell_disposers)
         agent.subscribe(lambda event: self._on_agent_event(session, event))
         self._handles[session.id] = handle
         return handle
@@ -3670,7 +3755,7 @@ class HarnessService:
             else DEFAULT_SEARCH_MAX_USES,
         )
 
-    def _effective_permission_mode(self) -> PermissionMode:
+    def _default_permission_mode(self) -> PermissionMode:
         value = self.settings.get_value_sync("permission").get("defaultPreset")
         if isinstance(value, str):
             try:
@@ -3678,6 +3763,71 @@ class HarnessService:
             except ValueError:
                 pass
         return self.permission_mode
+
+    def _default_approval_policy(self) -> ApprovalPolicy:
+        return (
+            "never"
+            if self._default_permission_mode() is PermissionMode.DANGER_FULL_ACCESS
+            else "ask"
+        )
+
+    def _effective_approval_policy(self, session: Session) -> ApprovalPolicy:
+        value = self.permissions.fold(session.events).approval
+        return value or self._default_approval_policy()
+
+    def _permission_projection(self, session: Session) -> JsonObject:
+        return self.permissions.projection(
+            session.events,
+            default_mode=self._default_permission_mode(),
+            default_approval=self._default_approval_policy(),
+        ).to_dict()
+
+    def _append_permission_changes(self, handle: SessionHandle, preset: str) -> None:
+        changes = self.permissions.change_events(
+            handle.session.events,
+            preset,
+            default_mode=self._default_permission_mode(),
+            default_approval=self._default_approval_policy(),
+        )
+        for event_type, data in changes:
+            event = handle.session.append(event_type, data)
+            self._publish_event(handle.session.id, event)
+
+    def _sync_live_permission(self, handle: SessionHandle) -> None:
+        """Apply the replayed mode to file tools and shell registration."""
+
+        mode = self._effective_permission_mode(handle.session)
+        handle.policy.set_mode(mode)
+        if mode is PermissionMode.DANGER_FULL_ACCESS and not handle.shell_disposers:
+            shell_disposers = install_shell_tools(
+                self._tool_registries[handle.session.id],
+                handle.policy,
+                jobs=self.jobs,
+            )
+            handle.shell_disposers.extend(shell_disposers)
+            handle.disposers.extend(shell_disposers)
+        elif mode is not PermissionMode.DANGER_FULL_ACCESS and handle.shell_disposers:
+            for dispose in reversed(handle.shell_disposers):
+                dispose()
+            handle.shell_disposers.clear()
+
+    def _effective_permission_mode(self, session: Session | None = None) -> PermissionMode:
+        default = self._default_permission_mode()
+        if session is None:
+            return default
+        return self.permissions.fold(session.events).mode or default
+
+    @staticmethod
+    def _set_shell_tools(
+        registry: ToolRegistry,
+        policy: WorkspacePolicy,
+        mode: PermissionMode,
+        *,
+        jobs: JobRegistry,
+    ) -> list[Callable[[], None]]:
+        if mode is not PermissionMode.DANGER_FULL_ACCESS:
+            return []
+        return install_shell_tools(registry, policy, jobs=jobs)
 
     def _publish_event(self, session_id: str, event: SessionEvent) -> None:
         self._publish_mux(
@@ -3690,6 +3840,9 @@ class HarnessService:
             self._publish_todo_projection(handle)
         if event.type in {"plan/mode", "command/run", "turn/start"}:
             self._publish_plan_projection(handle)
+        if event.type in {"permission/preset", "sandbox/mode", "approval/policy"}:
+            self._sync_live_permission(handle)
+            self._publish_permission_projection(handle)
         if event.type == "session/title":
             title = fold_session_title(handle.session)
             self._publish_mux(
@@ -3851,6 +4004,17 @@ class HarnessService:
             }
         )
 
+    def _publish_permission_projection(self, handle: SessionHandle) -> None:
+        self._publish_mux(
+            {
+                "type": "session/projection",
+                "sessionId": handle.session.id,
+                "key": "permissions",
+                "value": self._permission_projection(handle.session),
+                "seq": handle.session.seq - 1,
+            }
+        )
+
     def _projection_values(self, session: Session) -> JsonObject:
         title = fold_session_title(session)
         return {
@@ -3859,6 +4023,7 @@ class HarnessService:
             "plan": fold_plan_mode(session).to_dict(),
             "todos": self.todos.fold(session),
             "imageLimits": self._image_limits(),
+            "permissions": self._permission_projection(session),
         }
 
     def _image_limits(self) -> JsonObject:

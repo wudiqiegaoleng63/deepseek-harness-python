@@ -48,6 +48,9 @@ The native Python host now contains:
   durable workflow lifecycle events;
 - event-sourced plan mode with `/plan`, the `plan` projection, dynamic plan
   guidance, and `exit_plan_mode` user review;
+- event-sourced permission presets with the shared `permissions` projection,
+  `/permission` and `permission.set`, replayable sandbox/approval knobs, and
+  live shell registration only for `danger-full-access`;
 - the UI-backed `ask_user_question` tool and pending question response flow;
 - `messageFeedback/list|put|delete` with lifecycle fencing, compare-and-set
   versions, note validation, and a durable JSON sidecar;
@@ -167,9 +170,12 @@ It reads and writes one JSON-RPC object per line on stdin/stdout. Configure
 the provider with `--api-key`, `--base-url`, and `--request-timeout`, or use
 the matching `DEEPSEEK_API_KEY` and `DEEPSEEK_BASE_URL` environment variables.
 
-Shell execution is deliberately disabled in `workspace-write` mode until the
-platform sandbox provider is implemented. It can only be explicitly enabled
-with `--permission-mode danger-full-access`.
+Shell execution is deliberately disabled in `read-only` and `workspace-write`
+sessions until the platform sandbox provider is implemented. The shell/job
+tools are added when a session selects `danger-full-access`, and are still
+guarded by the live workspace policy; use `--permission-mode
+danger-full-access` for a headless session that explicitly opts into direct
+shell execution.
 
 ## Frontend and compatibility
 

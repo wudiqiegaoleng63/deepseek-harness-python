@@ -71,34 +71,52 @@ def install_builtin_tools(
     ]
     disposers.extend(_install_filesystem_tools(registry, policy))
     if enable_shell:
-        for name in ("bash", "run_bash"):
-            disposers.append(
-                registry.register(
-                    ToolDefinition(
-                        name=name,
-                        description=(
-                            "Execute a bash command and return stdout/stderr. "
-                            "Set run_in_background to true for long-running work; "
-                            "read it with job_output and stop it with job_kill."
-                        ),
-                        parameters={
-                            "type": "object",
-                            "properties": {
-                                "command": {"type": "string"},
-                                "description": {"type": "string"},
-                                "timeoutMs": {"type": "number"},
-                                "timeout_seconds": {"type": "number"},
-                                "workdir": {"type": "string"},
-                                "run_in_background": {"type": "boolean"},
-                            },
-                            "required": ["command"],
-                            "additionalProperties": False,
+        disposers.extend(install_shell_tools(registry, policy, jobs=jobs))
+    return disposers
+
+
+def install_shell_tools(
+    registry: ToolRegistry,
+    policy: WorkspacePolicy,
+    *,
+    jobs: JobRegistry | None = None,
+) -> list[Callable[[], None]]:
+    """Install shell and background-job tools for a live permission mode.
+
+    The host can add/remove this capability when a session switches between
+    permission presets.  The executor still checks ``WorkspacePolicy`` on
+    every call, so registration is not a security boundary.
+    """
+
+    disposers: list[Callable[[], None]] = []
+    for name in ("bash", "run_bash"):
+        disposers.append(
+            registry.register(
+                ToolDefinition(
+                    name=name,
+                    description=(
+                        "Execute a bash command and return stdout/stderr. "
+                        "Set run_in_background to true for long-running work; "
+                        "read it with job_output and stop it with job_kill."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"},
+                            "description": {"type": "string"},
+                            "timeoutMs": {"type": "number"},
+                            "timeout_seconds": {"type": "number"},
+                            "workdir": {"type": "string"},
+                            "run_in_background": {"type": "boolean"},
                         },
-                        execute=lambda args, ctx: _run_bash(args, policy, jobs, ctx.session_id),
-                    )
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                    execute=lambda args, ctx: _run_bash(args, policy, jobs, ctx.session_id),
                 )
             )
-        disposers.extend(_install_job_tools(registry, jobs))
+        )
+    disposers.extend(_install_job_tools(registry, jobs))
     return disposers
 
 

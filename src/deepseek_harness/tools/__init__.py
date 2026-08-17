@@ -1,6 +1,6 @@
 """Model-facing tool registry and local capability providers."""
 
-from .builtin import install_builtin_tools
+from .builtin import install_builtin_tools, install_shell_tools
 from .policy import PermissionMode, WorkspacePolicy
 from .registry import ToolContext, ToolDefinition, ToolRegistry, ToolResult
 
@@ -12,4 +12,5 @@ __all__ = [
     "ToolResult",
     "WorkspacePolicy",
     "install_builtin_tools",
+    "install_shell_tools",
 ]

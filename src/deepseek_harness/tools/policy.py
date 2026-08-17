@@ -19,7 +19,7 @@ class PermissionMode(StrEnum):
     DANGER_FULL_ACCESS = "danger-full-access"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class WorkspacePolicy:
     root: Path
     mode: PermissionMode = PermissionMode.WORKSPACE_WRITE
@@ -64,6 +64,13 @@ class WorkspacePolicy:
             raise PermissionError(
                 "shell execution requires a platform sandbox or danger-full-access mode"
             )
+
+    def set_mode(self, mode: PermissionMode) -> None:
+        """Change the live session mode after a durable permission event."""
+
+        if not isinstance(mode, PermissionMode):
+            raise TypeError("mode must be a PermissionMode")
+        self.mode = mode
 
     def _assert_inside(self, path: Path) -> None:
         if not self._inside(path, self.root):

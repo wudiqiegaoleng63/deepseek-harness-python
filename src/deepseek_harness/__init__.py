@@ -51,6 +51,16 @@ from .lsp_stdio import (
     normalize_locations,
 )
 from .models import Message, TextContent, ToolCallContent, ToolResultContent
+from .permissions import (
+    APPROVAL_POLICIES,
+    CUSTOM_PERMISSION_PRESET,
+    DEFAULT_PERMISSION_PRESETS,
+    ApprovalPolicy,
+    PermissionKnobs,
+    PermissionPreset,
+    PermissionPresetManager,
+    PermissionProjection,
+)
 from .sdk import DeepSeekHarness, DeepSeekHarnessConfig
 from .sdk import RunResult as SdkRunResult
 from .sdk_process import (
@@ -115,9 +125,13 @@ from .web_capability import (
 __all__ = [
     "Agent",
     "AgentStatus",
+    "APPROVAL_POLICIES",
+    "ApprovalPolicy",
     "CheckpointCallback",
     "CompactionPolicy",
     "CompactionResult",
+    "CUSTOM_PERMISSION_PRESET",
+    "DEFAULT_PERMISSION_PRESETS",
     "DeepSeekAdapter",
     "DeepSeekHarness",
     "DeepSeekHarnessConfig",
@@ -150,6 +164,10 @@ __all__ = [
     "ProcessSession",
     "ProcessRunResult",
     "PRUNE_MARKER",
+    "PermissionKnobs",
+    "PermissionPreset",
+    "PermissionPresetManager",
+    "PermissionProjection",
     "PruneResult",
     "PrunedEntry",
     "RunResult",
