@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from .llm.adapter import LlmAdapter
+from .llm.types import RetryPolicy
 from .tools import PermissionMode
 from .web.service import HarnessService
 
@@ -36,6 +37,7 @@ class DeepSeekHarnessConfig:
     api_key: str | None = None
     request_timeout_seconds: float | None = 300.0
     shutdown_timeout_seconds: float = 5.0
+    retry_policy: RetryPolicy | None = None
     adapter_factory: AdapterFactory | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -145,6 +147,7 @@ class DeepSeekHarness:
                 model=self.config.model,
                 permission_mode=self.config.permission_mode,
                 adapter_factory=self.config.adapter_factory,
+                retry_policy=self.config.retry_policy,
             )
             self._runtime = runtime
             loop.run_until_complete(self._configure(runtime))

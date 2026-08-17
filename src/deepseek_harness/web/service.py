@@ -24,7 +24,7 @@ from ..dynamic_cordis import DynamicCordisService, install_dynamic_tools
 from ..errors import HarnessError
 from ..goals import GoalError, GoalManager
 from ..jobs import JobHandle, JobOutcome, JobRegistry
-from ..llm import DeepSeekAdapter, LlmCallConfig
+from ..llm import DeepSeekAdapter, LlmCallConfig, RetryPolicy
 from ..llm.adapter import LlmAdapter
 from ..message_feedback import MessageFeedbackManager
 from ..models import ImageContent, Message, TextContent
@@ -153,12 +153,14 @@ class HarnessService:
         model: str = "deepseek-v4-flash",
         permission_mode: PermissionMode = PermissionMode.WORKSPACE_WRITE,
         adapter_factory: AdapterFactory | None = None,
+        retry_policy: RetryPolicy | None = None,
     ) -> None:
         self.store = JsonlSessionStore(session_root)
         state_root = self.store.root
         self.cwd = Path(cwd or Path.cwd()).expanduser().resolve()
         self.model = model
         self.permission_mode = permission_mode
+        self.retry_policy = retry_policy
         self.attachments = AttachmentStore(state_root)
         self.presets = AgentPresetRegistry(state_root)
         self.goals = GoalManager()
@@ -3553,6 +3555,7 @@ class HarnessService:
                 reasoning_effort=reasoning_effort,
             ),
             system_prompt=system_prompt,
+            retry_policy=self.retry_policy,
         )
         handle = SessionHandle(session, agent, disposers)
         agent.subscribe(lambda event: self._publish_event(session.id, event))

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from ..errors import ConfigurationError, LlmError, LlmFailure
 from ..llm.adapter import LlmAdapter
-from ..llm.types import LlmCallConfig, LlmRequest, StreamChunk
+from ..llm.types import LlmCallConfig, LlmRequest, RetryPolicy, StreamChunk
 from ..models import (
     JsonValue,
     Message,
@@ -53,6 +55,7 @@ class Agent:
         config: LlmCallConfig | None = None,
         system_prompt: str | Callable[[], str] | None = None,
         max_steps: int = 64,
+        retry_policy: RetryPolicy | None = None,
     ) -> None:
         self.session = session
         self.llm = llm
@@ -60,6 +63,7 @@ class Agent:
         self.config = config or LlmCallConfig()
         self.system_prompt = system_prompt
         self.max_steps = max_steps
+        self.retry_policy = retry_policy or RetryPolicy()
         self.status: AgentStatus = "idle"
         self._listeners: list[EventListener] = []
         self._run_lock = asyncio.Lock()
@@ -124,33 +128,65 @@ class Agent:
         try:
             for step in range(1, self.max_steps + 1):
                 await self._append("step/start", {"turn": turn, "step": step})
-                text_parts: list[str] = []
-                reasoning_parts: list[str] = []
-                calls: dict[int, _ToolCallAccumulator] = {}
-                request = LlmRequest(
-                    messages=self.session.derive_messages(),
-                    config=self.config,
-                    system=(
-                        self.system_prompt()
-                        if callable(self.system_prompt)
-                        else self.system_prompt
-                    ),
-                    tools=self.tools.schemas(),
-                )
-                try:
-                    async for chunk in self.llm.stream(request):
-                        await self._append(
-                            "assistant/chunk",
-                            {"turn": turn, "step": step, "chunk": chunk.to_dict()},
+                retry = 0
+                while True:
+                    text_parts: list[str] = []
+                    reasoning_parts: list[str] = []
+                    calls: dict[int, _ToolCallAccumulator] = {}
+                    finish_reason = None
+                    request = LlmRequest(
+                        messages=self.session.derive_messages(),
+                        config=self.config,
+                        system=self._resolved_system_prompt(),
+                        tools=self.tools.schemas(),
+                    )
+                    try:
+                        async for chunk in self.llm.stream(request):
+                            await self._append(
+                                "assistant/chunk",
+                                {"turn": turn, "step": step, "chunk": chunk.to_dict()},
+                            )
+                            self._consume_chunk(chunk, text_parts, reasoning_parts, calls)
+                            if chunk.kind == "done" and chunk.finish_reason:
+                                finish_reason = self._normalize_finish_reason(chunk.finish_reason)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        failure = self._failure_from_exception(exc)
+                        retry += 1
+                        if not self.retry_policy.allows(failure, retry):
+                            await self._append("step/end", {"turn": turn, "step": step})
+                            reason = {
+                                "kind": "error",
+                                "failure": failure.to_dict(),
+                                "error": {"code": failure.code, "message": failure.message},
+                            }
+                            await self._append("turn/end", {"turn": turn, "reason": reason})
+                            return self._result(first_seq, final_text, "error")
+                        retry_id = f"retry-{uuid.uuid4().hex}"
+                        delay_ms = int(
+                            self.retry_policy.delay_seconds(retry, failure.retry_after_ms) * 1000
                         )
-                        self._consume_chunk(chunk, text_parts, reasoning_parts, calls)
-                        if chunk.kind == "done" and chunk.finish_reason:
-                            finish_reason = self._normalize_finish_reason(chunk.finish_reason)
-                except Exception as exc:
-                    await self._append("step/end", {"turn": turn, "step": step})
-                    reason = {"kind": "error", "error": {"code": "LLM_ERROR", "message": str(exc)}}
-                    await self._append("turn/end", {"turn": turn, "reason": reason})
-                    return self._result(first_seq, final_text, "error")
+                        retry_data: dict[str, JsonValue] = {
+                            "retryId": retry_id,
+                            "turn": turn,
+                            "step": step,
+                            "provider": self.config.provider,
+                            "mode": self.retry_policy.mode,
+                            "retry": retry,
+                            "delayMs": delay_ms,
+                            "failure": failure.to_dict(),
+                        }
+                        if self.retry_policy.mode == "normal":
+                            retry_data["maxRetries"] = self.retry_policy.max_retries
+                        await self._append("llm/retry", retry_data)
+                        await asyncio.sleep(delay_ms / 1000)
+                        await self._append(
+                            "llm/retry-started",
+                            {"retryId": retry_id, "turn": turn, "step": step, "retry": retry},
+                        )
+                        continue
+                    break
 
                 blocks: list[Any] = []
                 if reasoning_parts:
@@ -254,6 +290,22 @@ class Agent:
         if reason in {"stop", "completed"}:
             return "completed"
         return reason
+
+    @staticmethod
+    def _failure_from_exception(error: Exception) -> LlmFailure:
+        if isinstance(error, LlmError):
+            return error.failure()
+        if isinstance(error, ConfigurationError):
+            return LlmFailure(str(error), "CONFIGURATION")
+        if isinstance(error, (TimeoutError, asyncio.TimeoutError)):
+            return LlmFailure(str(error) or "LLM request timed out", "TIMEOUT")
+        return LlmFailure(str(error) or "LLM adapter failed", "UNKNOWN")
+
+    def _resolved_system_prompt(self) -> str | None:
+        value = self.system_prompt
+        if value is None or isinstance(value, str):
+            return value
+        return value()
 
     @staticmethod
     def _block_from_dict_or_value(value: Any) -> Any:

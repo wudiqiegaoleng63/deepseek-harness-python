@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -68,8 +70,14 @@ class DeepSeekAdapter:
             ) as response:
                 if response.status_code >= 400:
                     body = (await response.aread()).decode("utf-8", errors="replace")
+                    detail, provider_code = self._error_detail(body)
                     raise LlmError(
-                        f"DeepSeek request failed ({response.status_code}): {body[:1000]}"
+                        f"DeepSeek request failed ({response.status_code}): {detail[:1000]}",
+                        code=self._error_code(response.status_code, detail, provider_code),
+                        status=response.status_code,
+                        retry_after_ms=self._retry_after_ms(response.headers.get("retry-after")),
+                        request_id=response.headers.get("x-request-id")
+                        or response.headers.get("request-id"),
                     )
                 saw_done = False
                 async for line in response.aiter_lines():
@@ -84,13 +92,20 @@ class DeepSeekAdapter:
                     try:
                         data = json.loads(raw)
                     except json.JSONDecodeError as exc:
-                        raise LlmError("DeepSeek returned malformed SSE JSON") from exc
+                        raise LlmError(
+                            "DeepSeek returned malformed SSE JSON",
+                            code="MALFORMED_RESPONSE",
+                        ) from exc
                     for chunk in self._chunks(data):
                         yield chunk
                 if not saw_done:
                     yield StreamChunk(kind="done", finish_reason="stop")
+        except httpx.TimeoutException as exc:
+            raise LlmError("DeepSeek request timed out", code="TIMEOUT") from exc
+        except httpx.TransportError as exc:
+            raise LlmError(f"DeepSeek transport failed: {exc}", code="TRANSPORT") from exc
         except httpx.HTTPError as exc:
-            raise LlmError(f"DeepSeek transport failed: {exc}") from exc
+            raise LlmError(f"DeepSeek HTTP client failed: {exc}", code="TRANSPORT") from exc
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -179,3 +194,54 @@ class DeepSeekAdapter:
             if finish is not None:
                 chunks.append(StreamChunk(kind="done", finish_reason=str(finish), usage=usage))
         return chunks
+
+    @staticmethod
+    def _error_detail(body: str) -> tuple[str, str | None]:
+        try:
+            value = json.loads(body)
+        except json.JSONDecodeError:
+            return body or "provider returned no error body", None
+        if not isinstance(value, dict):
+            return body or "provider returned no error body", None
+        error = value.get("error")
+        if not isinstance(error, dict):
+            return body or "provider returned no error body", None
+        message = error.get("message")
+        provider_code = error.get("code") or error.get("type")
+        detail = message if isinstance(message, str) else json.dumps(error, ensure_ascii=False)
+        return detail, provider_code if isinstance(provider_code, str) else None
+
+    @staticmethod
+    def _error_code(status: int, detail: str, provider_code: str | None) -> str:
+        lowered = f"{provider_code or ''} {detail}".casefold()
+        if status == 429 or "rate limit" in lowered or "too many requests" in lowered:
+            return "RATE_LIMIT"
+        if status in {408, 504}:
+            return "TIMEOUT"
+        if 500 <= status <= 599:
+            return "SERVER"
+        if status in {401, 403}:
+            return "INVALID_CREDENTIAL"
+        if status == 402 or any(term in lowered for term in ("quota", "insufficient balance")):
+            return "QUOTA"
+        if "context" in lowered and any(term in lowered for term in ("exceed", "length", "limit")):
+            return "CONTEXT_WINDOW_EXCEEDED"
+        return "PROVIDER"
+
+    @staticmethod
+    def _retry_after_ms(value: str | None) -> int | None:
+        if not value:
+            return None
+        try:
+            seconds = float(value)
+        except ValueError:
+            try:
+                target = parsedate_to_datetime(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if target.tzinfo is None:
+                target = target.replace(tzinfo=UTC)
+            seconds = (target - datetime.now(UTC)).total_seconds()
+        if seconds < 0:
+            return None
+        return int(seconds * 1000)

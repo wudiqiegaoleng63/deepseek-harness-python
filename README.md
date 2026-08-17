@@ -15,6 +15,8 @@ The native Python host now contains:
 - reversible hierarchical plugin contexts and serial/waterfall events;
 - provider-neutral messages, tool schemas, and stream chunks;
 - a DeepSeek chat-completions SSE adapter with thinking/reasoning controls;
+- structured provider failures with bounded exponential retry and durable
+  `llm/retry` lifecycle events for transient outages;
 - append-only Session events with atomic JSONL persistence, forked sessions, and
   durable one-shot/continuable subagents;
 - an Agent loop with tool-call continuation, cancellation, and queued prompts;

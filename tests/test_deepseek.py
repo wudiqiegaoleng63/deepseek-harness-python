@@ -4,7 +4,9 @@ import asyncio
 import json
 
 import httpx
+import pytest
 
+from deepseek_harness.errors import LlmError
 from deepseek_harness.llm import DeepSeekAdapter
 from deepseek_harness.llm.types import LlmCallConfig, LlmRequest, ToolSchema
 from deepseek_harness.models import create_user_message
@@ -99,6 +101,33 @@ def test_deepseek_adapter_parses_openai_compatible_sse() -> None:
         tools = captured["tools"]
         assert isinstance(tools, list)
         assert tools[0]["function"]["name"] == "read_file"
+        await adapter.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_deepseek_adapter_classifies_rate_limit_and_retry_after() -> None:
+    async def scenario() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                429,
+                headers={"retry-after": "1.5", "x-request-id": "req-1"},
+                json={"error": {"message": "slow down", "type": "rate_limit"}},
+                request=request,
+            )
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        adapter = DeepSeekAdapter(api_key="test-key", client=client)
+        request = LlmRequest(
+            messages=(create_user_message("hello"),),
+            config=LlmCallConfig(model="deepseek-chat"),
+        )
+        with pytest.raises(LlmError) as caught:
+            _ = [chunk async for chunk in adapter.stream(request)]
+        assert caught.value.code == "RATE_LIMIT"
+        assert caught.value.status == 429
+        assert caught.value.retry_after_ms == 1500
+        assert caught.value.request_id == "req-1"
         await adapter.aclose()
 
     asyncio.run(scenario())

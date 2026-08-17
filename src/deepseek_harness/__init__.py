@@ -6,7 +6,8 @@ on the same Session and Agent contracts.
 """
 
 from .agent import Agent, AgentStatus, RunResult
-from .llm import DeepSeekAdapter, LlmAdapter, LlmCallConfig, LlmRequest, StreamChunk
+from .errors import LlmFailure
+from .llm import DeepSeekAdapter, LlmAdapter, LlmCallConfig, LlmRequest, RetryPolicy, StreamChunk
 from .models import Message, TextContent, ToolCallContent, ToolResultContent
 from .sdk import DeepSeekHarness, DeepSeekHarnessConfig
 from .sdk import RunResult as SdkRunResult
@@ -32,12 +33,14 @@ __all__ = [
     "JsonlSessionStore",
     "LlmAdapter",
     "LlmCallConfig",
+    "LlmFailure",
     "LlmRequest",
     "Message",
     "NotificationSubscription",
     "ProcessSession",
     "ProcessRunResult",
     "RunResult",
+    "RetryPolicy",
     "SdkRunResult",
     "Session",
     "SessionEvent",

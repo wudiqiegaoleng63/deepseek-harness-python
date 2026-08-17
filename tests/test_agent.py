@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 
+import pytest
+
 from deepseek_harness.agent import Agent
-from deepseek_harness.llm.types import LlmRequest, StreamChunk
+from deepseek_harness.errors import ConfigurationError, LlmError
+from deepseek_harness.llm.types import LlmRequest, RetryPolicy, StreamChunk
 from deepseek_harness.session import Session
 from deepseek_harness.tools.registry import ToolDefinition, ToolRegistry, ToolResult
 
@@ -71,3 +74,83 @@ def test_agent_runs_tool_call_then_continues_model_turn() -> None:
         await agent.dispose()
 
     asyncio.run(scenario())
+
+
+class RetryAdapter:
+    def __init__(self, failure: Exception) -> None:
+        self.failure = failure
+        self.calls = 0
+
+    async def stream(self, request: LlmRequest) -> AsyncIterator[StreamChunk]:
+        del request
+        self.calls += 1
+        if self.calls == 1:
+            raise self.failure
+        yield StreamChunk(kind="text", text="recovered")
+        yield StreamChunk(kind="done", finish_reason="stop")
+
+    async def aclose(self) -> None:
+        return None
+
+
+def test_agent_retries_transient_llm_failures_with_durable_events() -> None:
+    async def scenario() -> None:
+        session = Session("session-retry")
+        adapter = RetryAdapter(LlmError("temporary outage", code="SERVER", status=503))
+        agent = Agent(
+            session,
+            adapter,
+            retry_policy=RetryPolicy(
+                initial_delay_seconds=0.001,
+                max_delay_seconds=0.001,
+                jitter_ratio=0,
+            ),
+        )
+        result = await agent.run("retry this")
+
+        assert adapter.calls == 2
+        assert result.final_response == "recovered"
+        assert result.finish_reason == "completed"
+        retry = [event for event in result.events if event.type == "llm/retry"]
+        assert len(retry) == 1
+        assert retry[0].data["failure"] == {
+            "message": "temporary outage",
+            "code": "SERVER",
+            "status": 503,
+        }
+        assert any(event.type == "llm/retry-started" for event in result.events)
+        await agent.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_agent_does_not_retry_configuration_failures() -> None:
+    async def scenario() -> None:
+        session = Session("session-no-retry")
+        adapter = RetryAdapter(ConfigurationError("missing key"))
+        agent = Agent(session, adapter)
+        result = await agent.run("do not retry")
+
+        assert adapter.calls == 1
+        assert result.finish_reason == "error"
+        end = next(event for event in result.events if event.type == "turn/end")
+        reason = end.data["reason"]
+        assert isinstance(reason, dict)
+        failure = reason["failure"]
+        assert isinstance(failure, dict)
+        assert failure["code"] == "CONFIGURATION"
+        assert not any(event.type == "llm/retry" for event in result.events)
+        await agent.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_retry_policy_validates_and_honors_provider_delay() -> None:
+    with pytest.raises(ValueError, match="positive"):
+        RetryPolicy(initial_delay_seconds=0)
+    with pytest.raises(ValueError, match="unique"):
+        RetryPolicy(retryable_codes=("SERVER", "SERVER"))
+
+    policy = RetryPolicy(initial_delay_seconds=0.5, max_delay_seconds=2, jitter_ratio=0)
+    assert policy.delay_seconds(1, retry_after_ms=1250) == 1.25
+    assert policy.delay_seconds(3, random_value=0) == 2
