@@ -21,6 +21,7 @@ from ..agent import Agent
 from ..agent_presets import AgentPresetError, AgentPresetRegistry
 from ..attachments import IMAGE_MEDIA_TYPES, AttachmentError, AttachmentStore, ImageAttachment
 from ..checkpoint import SessionCheckpointPolicy
+from ..code_mode import CodeRuntimeConfig, install_code_tool, render_code_sdk
 from ..compaction import CompactionPolicy, ManualCompactionError
 from ..dynamic_cordis import DynamicCordisService, install_dynamic_tools
 from ..errors import HarnessError
@@ -198,6 +199,7 @@ class HarnessService:
         agent_instructions_max_bytes: int = 65_536,
         agent_instructions_max_source_bytes: int = 1_048_576,
         dsh_home: str | os.PathLike[str] | None = None,
+        tools_mode: Literal["native", "code", "both"] | None = None,
     ) -> None:
         self.store = JsonlSessionStore(session_root)
         state_root = self.store.root
@@ -213,6 +215,10 @@ class HarnessService:
             max_inline_bytes=spill_max_inline_bytes,
         )
         self.session_title_llm = session_title_llm
+        configured_tools_mode = tools_mode or os.getenv("DSH_TOOLS_MODE") or "native"
+        if configured_tools_mode not in {"native", "code", "both"}:
+            raise ValueError("tools_mode must be native, code, or both")
+        self.tools_mode = cast(Literal["native", "code", "both"], configured_tools_mode)
         self.instruction_loader = WorkspaceInstructionLoader(
             dsh_home=dsh_home,
             max_bytes=agent_instructions_max_bytes,
@@ -3761,6 +3767,15 @@ class HarnessService:
         disposers.extend(install_dynamic_tools(registry, self.dynamic, session.id))
         disposers.extend(install_lsp_tools(registry, self.lsp))
         disposers.extend(install_web_tools(registry, self.web))
+        if self.tools_mode in {"code", "both"}:
+            disposers.append(
+                install_code_tool(
+                    registry,
+                    config=CodeRuntimeConfig(),
+                )
+            )
+            if self.tools_mode == "code":
+                registry.set_visible_names({"run_code"})
         selection = session.header.model_selection or self._default_selection()
         provider = selection.get("provider")
         selected_model = selection.get("model")
@@ -3788,9 +3803,12 @@ class HarnessService:
         )
 
         def system_prompt() -> str:
+            prompt = base_system_prompt
+            if self.tools_mode in {"code", "both"}:
+                prompt += "\n\n" + render_code_sdk(registry)
             if not fold_plan_mode(session).active:
-                return base_system_prompt
-            return base_system_prompt + (
+                return prompt
+            return prompt + (
                 "\n\nPlan mode is active. Explore the workspace and reason about the "
                 "implementation "
                 "before changing files. Present the complete plan with exit_plan_mode for user "

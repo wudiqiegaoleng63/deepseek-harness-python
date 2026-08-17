@@ -57,6 +57,8 @@ The native Python host now contains:
   `contextBreakdown`, and `sessionStats` projections for the shared chat UI;
 - bounded, durable workspace instruction baselines from `AGENTS.md` and
   `CLAUDE.md`, refreshed between model steps with UTF-8 source limits;
+- optional Python Code Mode (`tools_mode="code"` or `"both"`) with `run_code`,
+  async tool calls, bounded output, and wall-clock execution limits;
 - the UI-backed `ask_user_question` tool and pending question response flow;
 - `messageFeedback/list|put|delete` with lifecycle fencing, compare-and-set
   versions, note validation, and a durable JSON sidecar;

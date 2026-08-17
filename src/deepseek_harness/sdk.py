@@ -10,7 +10,7 @@ from collections.abc import Callable, Coroutine
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 from .compaction import CompactionPolicy
 from .llm.adapter import LlmAdapter
@@ -43,6 +43,7 @@ class DeepSeekHarnessConfig:
     compaction_policy: CompactionPolicy | None = None
     spill_max_inline_bytes: int | None = 50_000
     session_title_llm: SessionTitleLlmConfig | None = None
+    tools_mode: Literal["native", "code", "both"] | None = None
     adapter_factory: AdapterFactory | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -162,6 +163,7 @@ class DeepSeekHarness:
                 compaction_policy=self.config.compaction_policy,
                 spill_max_inline_bytes=self.config.spill_max_inline_bytes,
                 session_title_llm=self.config.session_title_llm,
+                tools_mode=self.config.tools_mode,
             )
             self._runtime = runtime
             loop.run_until_complete(self._configure(runtime))

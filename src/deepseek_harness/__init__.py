@@ -7,6 +7,15 @@ on the same Session and Agent contracts.
 
 from .agent import Agent, AgentStatus, RunResult
 from .checkpoint import CheckpointCallback, SessionCheckpointPolicy
+from .code_mode import (
+    CodeRunFailure,
+    CodeRunResult,
+    CodeRuntime,
+    CodeRuntimeConfig,
+    ToolCallError,
+    install_code_tool,
+    render_code_sdk,
+)
 from .compaction import (
     CompactionPolicy,
     CompactionResult,
@@ -150,6 +159,13 @@ __all__ = [
     "CompactionPolicy",
     "CompactionResult",
     "ManualCompactionError",
+    "CodeRunFailure",
+    "CodeRunResult",
+    "CodeRuntime",
+    "CodeRuntimeConfig",
+    "ToolCallError",
+    "install_code_tool",
+    "render_code_sdk",
     "DEFAULT_INSTRUCTION_FILE_CANDIDATES",
     "DEFAULT_LOCAL_INSTRUCTION_FILE_CANDIDATES",
     "DEFAULT_MAX_INSTRUCTION_BYTES",

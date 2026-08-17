@@ -58,6 +58,7 @@ class ToolRegistry:
     def __init__(self, result_transformer: ToolResultTransformer | None = None) -> None:
         self._tools: dict[str, ToolDefinition] = {}
         self._result_transformer = result_transformer
+        self._visible_names: set[str] | None = None
 
     def register(self, definition: ToolDefinition) -> Callable[[], None]:
         if not definition.name or definition.name in self._tools:
@@ -78,7 +79,21 @@ class ToolRegistry:
         return self._tools.get(name)
 
     def schemas(self) -> tuple[ToolSchema, ...]:
+        return tuple(
+            definition.schema()
+            for definition in self._tools.values()
+            if self._visible_names is None or definition.name in self._visible_names
+        )
+
+    def all_schemas(self) -> tuple[ToolSchema, ...]:
+        """Return every registered schema, including code-mode hidden tools."""
+
         return tuple(definition.schema() for definition in self._tools.values())
+
+    def set_visible_names(self, names: set[str] | None) -> None:
+        """Limit model-visible schemas while keeping tools callable by bridges."""
+
+        self._visible_names = None if names is None else set(names)
 
     def names(self) -> tuple[str, ...]:
         return tuple(self._tools)
