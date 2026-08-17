@@ -28,6 +28,16 @@ from .sdk_process import (
     ProcessSession,
 )
 from .session import JsonlSessionStore, Session, SessionEvent, SessionHeader, SessionSurfaceNode
+from .session_title import (
+    SessionTitleConfig,
+    SessionTitleInvalidError,
+    SessionTitleService,
+    SessionTitleSnapshot,
+    fallback_session_title,
+    fold_session_title,
+    normalize_session_title,
+    truncate_title_utf8,
+)
 from .spill import (
     LocalSpillStore,
     SaveTextSpill,
@@ -92,6 +102,10 @@ __all__ = [
     "SessionHeader",
     "SessionSurfaceNode",
     "SessionCheckpointPolicy",
+    "SessionTitleConfig",
+    "SessionTitleInvalidError",
+    "SessionTitleService",
+    "SessionTitleSnapshot",
     "LocalSpillStore",
     "SaveTextSpill",
     "SpillOwner",
@@ -122,4 +136,8 @@ __all__ = [
     "format_search_output",
     "install_web_tools",
     "DEFAULT_TOOL_RESULT_PRUNE_CONFIG",
+    "fallback_session_title",
+    "fold_session_title",
+    "normalize_session_title",
+    "truncate_title_utf8",
 ]

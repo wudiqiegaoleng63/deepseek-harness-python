@@ -33,6 +33,11 @@ from ..models import ImageContent, Message, TextContent
 from ..plans import fold as fold_plan_mode
 from ..plans import has_open_turn
 from ..session import JsonlSessionStore, Session, SessionEvent
+from ..session_title import (
+    SessionTitleInvalidError,
+    SessionTitleService,
+    fold_session_title,
+)
 from ..settings import (
     CredentialError,
     CredentialStore,
@@ -190,6 +195,7 @@ class HarnessService:
         self.goals = GoalManager()
         self.todos = TodoManager(allow_parallel_in_progress=True)
         self.message_feedback = MessageFeedbackManager(state_root, max_note_bytes=8192)
+        self.session_titles = SessionTitleService()
         self.settings = SettingsRegistry(state_root)
         self.settings.register(
             "ui-onboarding",
@@ -398,6 +404,9 @@ class HarnessService:
                 "running": handle.agent.status == "running",
                 "blank": self._is_blank(session),
             }
+            title = fold_session_title(session)
+            if title is not None:
+                summary["title"] = title.title
             if session.header.parent_session:
                 summary["parentSessionId"] = session.header.parent_session
             if session.header.origin == "subagent":
@@ -1053,16 +1062,11 @@ class HarnessService:
             raw_title = payload.get("title")
             if not isinstance(raw_title, str):
                 raise ApiFault("bad-request", "title must be a string")
-            title = raw_title.strip()
-            if not title:
-                raise ApiFault(
-                    "title-invalid",
-                    "session title cannot be empty",
-                    {"sessionId": session_id},
-                )
-            event = handle.session.append(
-                "session/title", {"title": title, "source": {"kind": "user"}}
-            )
+            try:
+                event = self.session_titles.rename(handle.session, raw_title)
+            except SessionTitleInvalidError as exc:
+                raise ApiFault("title-invalid", str(exc), {"sessionId": session_id}) from exc
+            title = str(event.data["title"])
             await self.store.save(handle.session)
             self._publish_event(handle.session.id, event)
             return {"title": title, "seq": event.seq}
@@ -3607,7 +3611,7 @@ class HarnessService:
             checkpoint_policy=SessionCheckpointPolicy(self.store.save),
         )
         handle = SessionHandle(session, agent, disposers)
-        agent.subscribe(lambda event: self._publish_event(session.id, event))
+        agent.subscribe(lambda event: self._on_agent_event(session, event))
         self._handles[session.id] = handle
         return handle
 
@@ -3668,11 +3672,28 @@ class HarnessService:
             self._publish_todo_projection(handle)
         if event.type in {"plan/mode", "command/run", "turn/start"}:
             self._publish_plan_projection(handle)
+        if event.type == "session/title":
+            title = fold_session_title(handle.session)
+            self._publish_mux(
+                {
+                    "type": "session/projection",
+                    "sessionId": session_id,
+                    "key": "title",
+                    "value": title.title if title is not None else None,
+                    "seq": event.seq,
+                }
+            )
         if event.type == "turn/start":
             state = fold_plan_mode(handle.session)
             if state.pending and state.wanted is not None:
                 mode_event = handle.session.append("plan/mode", {"active": state.wanted})
                 self._publish_event(session_id, mode_event)
+
+    async def _on_agent_event(self, session: Session, event: SessionEvent) -> None:
+        self._publish_event(session.id, event)
+        title = self.session_titles.on_user_message(session, event)
+        if title is not None:
+            self._publish_event(session.id, title)
 
     def _publish_mux(self, frame: Frame) -> None:
         for queue in tuple(self._mux_subscribers):
@@ -3746,7 +3767,9 @@ class HarnessService:
         )
 
     def _projection_values(self, session: Session) -> JsonObject:
+        title = fold_session_title(session)
         return {
+            "title": title.title if title is not None else None,
             "goal": self.goals.fold(session).projection(),
             "plan": fold_plan_mode(session).to_dict(),
             "todos": self.todos.fold(session),

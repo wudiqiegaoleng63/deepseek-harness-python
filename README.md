@@ -23,6 +23,7 @@ The native Python host now contains:
   balanced tool boundaries, and durable `compaction/*` events;
 - model-free tool-result pruning with replay-safe head/middle/tail replacements;
 - session-scoped private spill files with bounded previews for oversized results;
+- deterministic, durable session titles with control-code sanitization and rename pinning;
 - append-only Session events with atomic JSONL persistence, forked sessions, and
   durable one-shot/continuable subagents;
 - an Agent loop with tool-call continuation, cancellation, and queued prompts;
