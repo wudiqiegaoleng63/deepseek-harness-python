@@ -227,8 +227,6 @@ class _TerminalSanitizer:
             cursor = escape + 2
         self._pending = pending[cursor:]
         rendered = "".join(output).replace("\r\n", "\n").replace("\r", "\n").replace("\x07", "")
-        if "dsh> " in rendered:
-            prompt = True
         return rendered, prompt
 
     def flush(self) -> str:
@@ -359,7 +357,7 @@ class _PtySession:
                     "PAGER": "cat",
                     "GIT_PAGER": "cat",
                     "PS1": "dsh> ",
-                    "PROMPT_COMMAND": "",
+                    "PROMPT_COMMAND": "printf \\\"\\033]133;D;%s\\007\\\" \\\"$?\\\"",
                     "HISTFILE": "/dev/null",
                     "BASH_SILENCE_DEPRECATION_WARNING": "1",
                     "DSH_SHELL": "1",
@@ -431,7 +429,10 @@ class _PtySession:
                 operation.settle("session_exit")
                 break
             now = self.loop.time()
-            if self.prompt_count > operation.start_prompt_count:
+            if (
+                self.prompt_count > operation.start_prompt_count
+                and self._foreground_pgid() == self.pid
+            ):
                 operation.settle("stdin_read")
                 break
             if (
@@ -684,6 +685,8 @@ class TerminalSessionService:
         self._next_id = 0
         self._lock = asyncio.Lock()
         self._disposing = False
+        self._closing_owners: set[str] = set()
+        self._pending_spawns: dict[str, set[asyncio.Future[None]]] = {}
 
     async def spawn(
         self,
@@ -714,6 +717,8 @@ class TerminalSessionService:
         async with self._lock:
             if self._disposing:
                 raise TerminalError("PTY service is disposing", "SERVICE_DISPOSING")
+            if owner in self._closing_owners:
+                raise TerminalError("PTY owner is being disposed", "OWNER_NOT_LIVE")
             if name is not None:
                 duplicate = any(
                     record.owner == owner and record.name == name
@@ -733,6 +738,8 @@ class TerminalSessionService:
                 reserved.add(name)
             self._next_id += 1
             session_id = f"pty-{self._next_id}"
+            pending = asyncio.get_running_loop().create_future()
+            self._pending_spawns.setdefault(owner, set()).add(pending)
         session: _PtySession | None = None
         try:
             session = await _PtySession.spawn(path, self.config, session_id, owner)
@@ -751,8 +758,15 @@ class TerminalSessionService:
                     pass
             raise
         finally:
-            if name is not None:
-                async with self._lock:
+            async with self._lock:
+                owned_pending = self._pending_spawns.get(owner)
+                if owned_pending is not None:
+                    owned_pending.discard(pending)
+                    if not owned_pending:
+                        self._pending_spawns.pop(owner, None)
+                if not pending.done():
+                    pending.set_result(None)
+                if name is not None:
                     reserved = self._reserved_names.get(owner)
                     if reserved is not None:
                         reserved.discard(name)
@@ -799,22 +813,44 @@ class TerminalSessionService:
         ]
 
     def has_owner_activity(self, owner: str) -> bool:
-        return any(record.owner == owner for record in self._sessions.values()) or (
-            owner in self._reserved_names
+        return (
+            any(record.owner == owner for record in self._sessions.values())
+            or owner in self._reserved_names
+            or owner in self._pending_spawns
         )
 
     async def close_owner(self, owner: str, reason: str = "PTY owner disposed") -> None:
-        records = [record for record in self._sessions.values() if record.owner == owner]
-        await self._close_records(records, reason)
-        self._reserved_names.pop(owner, None)
+        async with self._lock:
+            self._closing_owners.add(owner)
+            pending = tuple(self._pending_spawns.get(owner, ()))
+            records = [record for record in self._sessions.values() if record.owner == owner]
+        try:
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            await self._close_records(records, reason)
+        finally:
+            async with self._lock:
+                self._closing_owners.discard(owner)
+                self._reserved_names.pop(owner, None)
 
     async def close_all(self, reason: str = "PTY service disposed") -> None:
-        if self._disposing:
-            return
-        self._disposing = True
-        records = list(self._sessions.values())
+        async with self._lock:
+            if self._disposing:
+                return
+            self._disposing = True
+            records = list(self._sessions.values())
+            pending = tuple(
+                future
+                for futures in self._pending_spawns.values()
+                for future in futures
+            )
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         errors = await self._close_records(records, reason, clear=True)
-        self._reserved_names.clear()
+        async with self._lock:
+            self._reserved_names.clear()
+            self._closing_owners.clear()
+            self._pending_spawns.clear()
         if errors:
             raise RuntimeError(f"failed to clean up {len(errors)} PTY session(s): {errors[0]}")
 

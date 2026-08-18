@@ -190,6 +190,29 @@ def test_terminal_rejects_concurrent_send_and_supports_signals(tmp_path: Path) -
     asyncio.run(scenario())
 
 
+def test_terminal_does_not_treat_nested_prompt_as_shell_readiness(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        terminals = TerminalSessionService(_config(idle_seconds=0.1))
+        registry, disposers = _tools(tmp_path, terminals, owner="nested")
+        context = ToolContext("nested", str(tmp_path))
+        try:
+            await registry.execute("terminal_open", '{"type":"shell"}', context)
+            result = await registry.execute(
+                "terminal_send",
+                '{"sessionId":"pty-1","text":"bash -i"}',
+                context,
+            )
+            assert not result.is_error
+            assert result.meta is not None
+            assert result.meta["waitReason"] == "inferred_idle"
+        finally:
+            await terminals.close_all()
+            for dispose in reversed(disposers):
+                dispose()
+
+    asyncio.run(scenario())
+
+
 def test_terminal_send_and_read_output_are_bounded(tmp_path: Path) -> None:
     async def scenario() -> None:
         terminals = TerminalSessionService(_config(max_read_bytes=128, scrollback_bytes=256))
@@ -322,6 +345,51 @@ def test_service_dispose_closes_terminal_processes(tmp_path: Path) -> None:
         assert service.terminals.list("dispose") == []
         with pytest.raises(ProcessLookupError):
             os.kill(pid, 0)
+
+    asyncio.run(scenario())
+
+
+def test_service_dispose_waits_for_pending_terminal_startup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        import deepseek_harness.terminal as terminal_module
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        original_spawn = terminal_module._PtySession.spawn
+
+        async def delayed_spawn(
+            cls: object,
+            cwd: Path,
+            config: TerminalConfig,
+            session_id: str,
+            owner: str,
+        ) -> object:
+            del cls
+            started.set()
+            await release.wait()
+            return await original_spawn(cwd, config, session_id, owner)
+
+        monkeypatch.setattr(
+            terminal_module._PtySession,
+            "spawn",
+            classmethod(delayed_spawn),
+        )
+        terminals = TerminalSessionService(_config())
+        pending = asyncio.create_task(
+            terminals.spawn("pending", type="shell", cwd=tmp_path)
+        )
+        await started.wait()
+        disposing = asyncio.create_task(terminals.close_all())
+        await asyncio.sleep(0)
+        assert not disposing.done()
+        release.set()
+        with pytest.raises(Exception, match="disposing"):
+            await pending
+        await disposing
+        assert terminals.list("pending") == []
 
     asyncio.run(scenario())
 
