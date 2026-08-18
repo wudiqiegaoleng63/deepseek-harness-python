@@ -64,9 +64,16 @@ from ..settings import (
 )
 from ..skills import SkillRegistry
 from ..spill import LocalSpillStore, SpillPolicy
+from ..terminal import TerminalSessionService
 from ..todos import TodoError, TodoManager
 from ..tool_result_pruner import ToolResultPruner
-from ..tools import PermissionMode, WorkspacePolicy, install_builtin_tools, install_shell_tools
+from ..tools import (
+    PermissionMode,
+    WorkspacePolicy,
+    install_builtin_tools,
+    install_shell_tools,
+    install_terminal_tools,
+)
 from ..tools.registry import ToolContext, ToolDefinition, ToolRegistry, ToolResult
 from ..web_capability import (
     DEFAULT_SEARCH_BASE_URL,
@@ -336,6 +343,7 @@ class HarnessService:
         self._mux_subscribers: set[asyncio.Queue[Frame]] = set()
         self._host_subscribers: set[asyncio.Queue[Frame]] = set()
         self.jobs = JobRegistry(on_changed=self._jobs_changed)
+        self.terminals = TerminalSessionService()
         self.dynamic = DynamicCordisService(
             tool_registries=self._tool_registries,
             remote_event=self._publish_remote_event,
@@ -1942,6 +1950,7 @@ class HarnessService:
         if title_tasks:
             await asyncio.gather(*title_tasks, return_exceptions=True)
         self._session_title_tasks.clear()
+        await self.terminals.close_all()
         handles = tuple(self._handles.values())
         for handle in handles:
             if handle.task is not None and not handle.task.done():
@@ -3748,6 +3757,7 @@ class HarnessService:
             policy,
             permission_mode,
             jobs=self.jobs,
+            owner_session=session.id,
         )
         disposers.extend(shell_disposers)
         self._tool_registries[session.id] = registry
@@ -3919,10 +3929,12 @@ class HarnessService:
         mode = self._effective_permission_mode(handle.session)
         handle.policy.set_mode(mode)
         if mode is PermissionMode.DANGER_FULL_ACCESS and not handle.shell_disposers:
-            shell_disposers = install_shell_tools(
+            shell_disposers = self._set_shell_tools(
                 self._tool_registries[handle.session.id],
                 handle.policy,
+                mode,
                 jobs=self.jobs,
+                owner_session=handle.session.id,
             )
             handle.shell_disposers.extend(shell_disposers)
             handle.disposers.extend(shell_disposers)
@@ -3930,6 +3942,17 @@ class HarnessService:
             for dispose in reversed(handle.shell_disposers):
                 dispose()
             handle.shell_disposers.clear()
+            if self.terminals.has_owner_activity(handle.session.id):
+                task = asyncio.create_task(
+                    self.terminals.close_owner(handle.session.id, "permission mode changed")
+                )
+                task.add_done_callback(
+                    lambda completed: (
+                        None
+                        if completed.cancelled()
+                        else completed.exception()
+                    )
+                )
 
     def _effective_permission_mode(self, session: Session | None = None) -> PermissionMode:
         default = self._default_permission_mode()
@@ -3937,17 +3960,27 @@ class HarnessService:
             return default
         return self.permissions.fold(session.events).mode or default
 
-    @staticmethod
     def _set_shell_tools(
+        self,
         registry: ToolRegistry,
         policy: WorkspacePolicy,
         mode: PermissionMode,
         *,
         jobs: JobRegistry,
+        owner_session: str,
     ) -> list[Callable[[], None]]:
         if mode is not PermissionMode.DANGER_FULL_ACCESS:
             return []
-        return install_shell_tools(registry, policy, jobs=jobs)
+        return [
+            *install_shell_tools(registry, policy, jobs=jobs),
+            *install_terminal_tools(
+                registry,
+                self.terminals,
+                policy,
+                jobs=jobs,
+                owner_session=owner_session,
+            ),
+        ]
 
     def _publish_event(self, session_id: str, event: SessionEvent) -> None:
         self._publish_mux(

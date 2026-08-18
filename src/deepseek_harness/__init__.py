@@ -127,6 +127,15 @@ from .spill import (
     SpillSource,
     SpillStore,
 )
+from .terminal import (
+    ALLOWED_SIGNALS,
+    PtyUnsupportedError,
+    TerminalConfig,
+    TerminalError,
+    TerminalSessionService,
+    bound_terminal_text,
+    pty_supported,
+)
 from .tool_result_pruner import (
     DEFAULT_TOOL_RESULT_PRUNE_CONFIG,
     PRUNE_MARKER,
@@ -248,6 +257,13 @@ __all__ = [
     "ToolResultContent",
     "ToolResultPruneConfig",
     "ToolResultPruner",
+    "ALLOWED_SIGNALS",
+    "PtyUnsupportedError",
+    "TerminalConfig",
+    "TerminalError",
+    "TerminalSessionService",
+    "bound_terminal_text",
+    "pty_supported",
     "WebError",
     "WebFetchBody",
     "WebFetchResult",

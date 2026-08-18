@@ -180,10 +180,19 @@ the matching `DEEPSEEK_API_KEY` and `DEEPSEEK_BASE_URL` environment variables.
 
 Shell execution is deliberately disabled in `read-only` and `workspace-write`
 sessions until the platform sandbox provider is implemented. The shell/job
-tools are added when a session selects `danger-full-access`, and are still
-guarded by the live workspace policy; use `--permission-mode
-danger-full-access` for a headless session that explicitly opts into direct
-shell execution.
+and persistent terminal tools are added when a session selects
+`danger-full-access`, and are still guarded by the live workspace policy; use
+`--permission-mode danger-full-access` for a headless session that explicitly
+opts into direct shell execution.
+
+Persistent terminals use a POSIX PTY running `bash --noprofile --norc -i`.
+Their shell state survives across `terminal_send` calls, including `cd`, and
+sessions are isolated by Harness session ownership. The six compatible tools
+are `terminal_open`, `terminal_send`, `terminal_read`, `terminal_list`,
+`terminal_signal`, and `terminal_close`; background sends reuse `job_output`
+and `job_kill`. PTY support is intentionally not emulated on Windows or other
+platforms without POSIX PTYs, where the tools return an explicit capability
+error.
 
 ## Frontend and compatibility
 
