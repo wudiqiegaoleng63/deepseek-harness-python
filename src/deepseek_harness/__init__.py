@@ -97,6 +97,22 @@ from .sandbox import (
     SandboxUnavailableError,
     UnavailableSandbox,
 )
+from .schedule import (
+    MIN_EVERY_INTERVAL_SECONDS,
+    AfterScheduleRecord,
+    AtScheduleRecord,
+    EveryScheduleRecord,
+    ScheduleInputError,
+    ScheduleLogError,
+    ScheduleManager,
+    ScheduleRuntime,
+    fold_schedules,
+    install_schedule_tools,
+    parse_at_input,
+    reminder_batch_framing,
+    reminder_framing,
+    schedule_view,
+)
 from .sdk import DeepSeekHarness, DeepSeekHarnessConfig
 from .sdk import RunResult as SdkRunResult
 from .sdk_process import (
@@ -237,6 +253,20 @@ __all__ = [
     "PrunedEntry",
     "RunResult",
     "RetryPolicy",
+    "MIN_EVERY_INTERVAL_SECONDS",
+    "AfterScheduleRecord",
+    "AtScheduleRecord",
+    "EveryScheduleRecord",
+    "ScheduleInputError",
+    "ScheduleLogError",
+    "ScheduleManager",
+    "ScheduleRuntime",
+    "fold_schedules",
+    "install_schedule_tools",
+    "parse_at_input",
+    "reminder_batch_framing",
+    "reminder_framing",
+    "schedule_view",
     "BubblewrapSandbox",
     "SandboxExecutionPolicy",
     "SandboxMode",

@@ -59,6 +59,13 @@ The native Python host now contains:
   `CLAUDE.md`, refreshed between model steps with UTF-8 source limits;
 - optional Python Code Mode (`tools_mode="code"` or `"both"`) with `run_code`,
   async tool calls, bounded output, and wall-clock execution limits;
+- durable session-local reminders (`schedule_create`/`schedule_list`/
+  `schedule_delete`) with the TS `schedule/change` event fold, offset or
+  zoned absolute targets, creation-anchored fixed-rate rules of at least five
+  minutes, and follow-up turns framed exactly like the TS runtime;
+- workspace-write shell and persistent terminals confined through the
+  bubblewrap sandbox (read-only root bind, private `/tmp`, read-write
+  workspace bind) with fail-closed behavior when `bwrap` is absent;
 - the UI-backed `ask_user_question` tool and pending question response flow;
 - `messageFeedback/list|put|delete` with lifecycle fencing, compare-and-set
   versions, note validation, and a durable JSON sidecar;

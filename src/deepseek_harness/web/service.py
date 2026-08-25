@@ -46,6 +46,7 @@ from ..permissions import (
 from ..plans import fold as fold_plan_mode
 from ..plans import has_open_turn
 from ..sandbox import BubblewrapSandbox, SandboxProvider
+from ..schedule import ScheduleManager, ScheduleRuntime, install_schedule_tools
 from ..session import JsonlSessionStore, Session, SessionEvent
 from ..session_title import (
     SessionTitleInvalidError,
@@ -347,6 +348,18 @@ class HarnessService:
         self._host_subscribers: set[asyncio.Queue[Frame]] = set()
         self.jobs = JobRegistry(on_changed=self._jobs_changed)
         self.terminals = TerminalSessionService()
+        self.schedules = ScheduleManager()
+        self._schedule_runtime = ScheduleRuntime(
+            self.schedules,
+            sessions=lambda: [
+                handle.session
+                for handle in list(self._handles.values())
+                if handle.session.header.parent_session is None
+            ],
+            persist=self.store.save,
+            send=self._deliver_schedule_reminder,
+        )
+        self._schedule_runtime_started = False
         if sandbox_provider is not None:
             self.sandbox: SandboxProvider | None = sandbox_provider
         elif os.getenv("DSH_SANDBOX", "auto") == "off":
@@ -404,6 +417,7 @@ class HarnessService:
                 self._check_session_cwd(session, resolved_cwd)
                 self._check_session_preset(session, agent_preset)
             handle = self._attach(session)
+        self._ensure_schedule_runtime()
         self._publish_host(
             {
                 "type": "host/session-added",
@@ -513,6 +527,18 @@ class HarnessService:
             if len(matches) >= 20:
                 break
         return {"items": matches, "hasMore": False}
+
+    async def _deliver_schedule_reminder(self, session_id: str, framing: str) -> None:
+        await self.prompt(
+            session_id,
+            [{"type": "text", "text": framing}],
+            include_message_id=False,
+        )
+
+    def _ensure_schedule_runtime(self) -> None:
+        if not self._schedule_runtime_started:
+            self._schedule_runtime_started = True
+            self._schedule_runtime.start()
 
     async def prompt(
         self,
@@ -1964,6 +1990,7 @@ class HarnessService:
         if title_tasks:
             await asyncio.gather(*title_tasks, return_exceptions=True)
         self._session_title_tasks.clear()
+        await self._schedule_runtime.stop()
         handles = tuple(self._handles.values())
         await self.terminals.close_all()
         teardown_tasks = [
@@ -3794,6 +3821,14 @@ class HarnessService:
         disposers.extend(self._install_todo_tool(registry, session))
         disposers.extend(self._install_subagent_tools(registry, session))
         disposers.extend(install_dynamic_tools(registry, self.dynamic, session.id))
+        disposers.extend(
+            install_schedule_tools(
+                registry,
+                self.schedules,
+                session,
+                on_change=lambda: self._ensure_schedule_runtime(),
+            )
+        )
         disposers.extend(install_lsp_tools(registry, self.lsp))
         disposers.extend(install_web_tools(registry, self.web))
         if self.tools_mode in {"code", "both"}:
