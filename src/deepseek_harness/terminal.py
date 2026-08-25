@@ -8,7 +8,7 @@ a collection of one-shot subprocesses, so shell state survives between sends.
 from __future__ import annotations
 
 import asyncio
-import errno
+import codecs
 import os
 import shutil
 import signal
@@ -28,6 +28,7 @@ ALLOWED_SIGNALS: frozenset[str] = frozenset(
     {"SIGINT", "SIGTERM", "SIGKILL", "SIGTSTP", "SIGHUP"}
 )
 TRUNCATION_MARKER = "\n[output truncated]"
+_MAX_PENDING_BYTES = 65_536
 
 
 class TerminalError(RuntimeError):
@@ -63,6 +64,8 @@ class TerminalConfig:
     send_timeout_seconds: float = 30.0
     startup_timeout_seconds: float = 10.0
     close_grace_seconds: float = 1.0
+    cancel_grace_seconds: float = 2.0
+    max_sessions_per_owner: int = 8
 
     def __post_init__(self) -> None:
         for name in (
@@ -70,6 +73,7 @@ class TerminalConfig:
             "max_read_bytes",
             "scrollback_bytes",
             "scrollback_lines",
+            "max_sessions_per_owner",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -79,6 +83,7 @@ class TerminalConfig:
             "send_timeout_seconds",
             "startup_timeout_seconds",
             "close_grace_seconds",
+            "cancel_grace_seconds",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
@@ -175,14 +180,26 @@ class _BoundedText:
 
 
 class _TerminalSanitizer:
-    """Remove common terminal control sequences while preserving prompt text."""
+    """Remove common terminal control sequences while preserving prompt text.
+
+    Decoding is incremental, so a UTF-8 character split across PTY reads is
+    joined instead of being replaced.  An unterminated escape sequence is
+    retained only up to a hard byte bound; past the bound the sequence is
+    discarded (and its terminator skipped later) so a hostile stream cannot
+    grow the parser state without limit.
+    """
 
     def __init__(self) -> None:
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self._pending = ""
+        self._discard: Literal["osc", "csi"] | None = None
 
     def feed(self, data: bytes) -> tuple[str, bool]:
-        text = data.decode("utf-8", errors="replace")
+        text = self._decoder.decode(data)
+        if self._discard is not None:
+            text = self._strip_discarded(text)
         self._pending += text
+        self._enforce_pending_bound()
         output: list[str] = []
         prompt = False
         cursor = 0
@@ -230,9 +247,42 @@ class _TerminalSanitizer:
         return rendered, prompt
 
     def flush(self) -> str:
-        value = "" if self._pending.startswith("\x1b") else self._pending
+        try:
+            value = self._decoder.decode(b"", True)
+        except ValueError:
+            value = ""
+        if not self._pending.startswith("\x1b"):
+            value = self._pending + value
         self._pending = ""
+        self._discard = None
         return value.replace("\r\n", "\n").replace("\r", "\n").replace("\x07", "")
+
+    def _enforce_pending_bound(self) -> None:
+        if len(self._pending) <= _MAX_PENDING_BYTES:
+            return
+        # Drop the incomplete escape sequence; remember its family so the
+        # terminator arriving in a later chunk is skipped instead of leaking.
+        self._discard = "osc" if self._pending[1:2] == "]" else "csi"
+        self._pending = ""
+
+    def _strip_discarded(self, chunk: str) -> str:
+        if self._discard == "csi":
+            for index, char in enumerate(chunk):
+                if 0x40 <= ord(char) <= 0x7E:
+                    self._discard = None
+                    return chunk[index + 1 :]
+            return ""
+        index = 0
+        while index < len(chunk):
+            char = chunk[index]
+            if char == "\x07":
+                self._discard = None
+                return chunk[index + 1 :]
+            if char == "\x1b" and chunk[index + 1 : index + 2] == "\\":
+                self._discard = None
+                return chunk[index + 2 :]
+            index += 1
+        return ""
 
 
 @dataclass(slots=True)
@@ -275,6 +325,19 @@ class _SendOperation:
         )
         return True
 
+    async def join(self) -> dict[str, Any]:
+        """Await settlement without letting caller cancellation cancel the send.
+
+        A cancelled waiter still owns the foreground command, so cancellation
+        requests the usual foreground SIGINT before propagating.
+        """
+
+        try:
+            return await asyncio.shield(self.done)
+        except asyncio.CancelledError:
+            self.cancel()
+            raise
+
     async def _interrupt(self) -> None:
         try:
             await self.session._signal_foreground("SIGINT")
@@ -285,6 +348,16 @@ class _SendOperation:
         finally:
             self.cancel_finished.set()
             self.session._output_event.set()
+        # A command that traps or ignores SIGINT would otherwise hold the send
+        # slot until the full timeout; escalate after a bounded grace period.
+        await asyncio.sleep(self.session.config.cancel_grace_seconds)
+        if not self.done.done():
+            try:
+                await self.session._signal_foreground("SIGKILL")
+            except Exception:
+                pass
+            finally:
+                self.session._output_event.set()
 
     def settle(self, wait_reason: TerminalWaitReason) -> None:
         if self.done.done():
@@ -323,6 +396,7 @@ class _PtySession:
         self._closing = False
         self._close_task: asyncio.Task[None] | None = None
         self._reader_registered = True
+        self._master_closed = False
         self.loop.add_reader(master_fd, self._on_readable)
         self._wait_task = asyncio.create_task(
             self._wait_for_child(), name=f"dsh-terminal-wait-{pid}"
@@ -374,7 +448,23 @@ class _PtySession:
                 finally:
                     os._exit(127)
         os.set_blocking(master_fd, False)
-        return cls(pid, master_fd, config)
+        try:
+            return cls(pid, master_fd, config)
+        except BaseException as exc:
+            # Post-fork setup failed; never leak the forked child or its PTY.
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+            raise exc
 
     async def initialize(self) -> str:
         operation = self.start_send(text="", submit=False)
@@ -411,7 +501,7 @@ class _PtySession:
 
     async def _run_send(self, operation: _SendOperation, text: str, submit: bool) -> None:
         try:
-            if text:
+            if text and not operation.cancel_requested:
                 await self._write(text + ("\r" if submit else ""))
             await self._wait_for_send(operation)
         except asyncio.CancelledError:
@@ -420,6 +510,13 @@ class _PtySession:
             self._fail_active(operation, exc)
         finally:
             if self.active is operation and operation.done.done():
+                if operation.done.cancelled():
+                    # Defensive: an externally cancelled future must not leave
+                    # the foreground command running with the slot silently
+                    # released.  The shielded join() above makes this rare.
+                    asyncio.create_task(
+                        self._signal_foreground("SIGINT"), name=f"dsh-terminal-orphan-{self.pid}"
+                    )
                 self.active = None
 
     async def _wait_for_send(self, operation: _SendOperation) -> None:
@@ -509,6 +606,8 @@ class _PtySession:
             )
         if self._closing:
             raise TerminalError("PTY session is closing", "SESSION_CLOSING")
+        if self.status.kind == "exited":
+            raise TerminalError("PTY session has exited", "SESSION_EXITED")
         target = await self._signal_foreground(cast(TerminalSignal, signal_name))
         return {"delivered": True, "targetPgid": target}
 
@@ -532,13 +631,15 @@ class _PtySession:
         return target
 
     def _foreground_pgid(self) -> int | None:
+        # After the child is reaped the pid may be reused by an unrelated
+        # process; never fall back to it as a foreground group.
+        if self.status.kind == "exited" or self._master_closed:
+            return None
         try:
             value = os.tcgetpgrp(self.master_fd)
         except OSError:
-            value = self.pid
-        if value <= 0:
             return None
-        return value
+        return value if value > 0 else None
 
     async def close(self, reason: str = "model request") -> None:
         self._closing = True
@@ -546,38 +647,50 @@ class _PtySession:
             self._close_task = asyncio.create_task(
                 self._close_once(reason), name=f"dsh-terminal-close-{self.pid}"
             )
-        await self._close_task
+        # A cancelled caller must not cancel the shared teardown task.
+        await asyncio.shield(self._close_task)
 
     async def _close_once(self, reason: str) -> None:
         del reason  # Kept in the signature for diagnostic parity with the TS backend.
-        groups = self._signalable_groups()
-        self._send_groups(groups, signal.SIGTERM)
-        deadline = self.loop.time() + self.config.close_grace_seconds
-        while self.status.kind != "exited" and self.loop.time() < deadline:
-            await asyncio.sleep(0.05)
         if self.status.kind != "exited":
-            self._send_groups(self._signalable_groups() | groups, signal.SIGKILL)
+            groups = self._signalable_groups()
+            self._send_groups(groups, signal.SIGTERM)
             deadline = self.loop.time() + self.config.close_grace_seconds
             while self.status.kind != "exited" and self.loop.time() < deadline:
                 await asyncio.sleep(0.05)
+            if self.status.kind != "exited":
+                self._send_groups(self._signalable_groups() | groups, signal.SIGKILL)
+                deadline = self.loop.time() + self.config.close_grace_seconds
+                while self.status.kind != "exited" and self.loop.time() < deadline:
+                    await asyncio.sleep(0.05)
+            if self.status.kind != "exited":
+                try:
+                    os.kill(self.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         if self.status.kind != "exited":
-            try:
-                os.kill(self.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
             await self._wait_task
         if self.active is not None and not self.active.done.done():
             self.active.settle("session_exit")
+        self._close_master()
+
+    def _close_master(self) -> None:
         if self._reader_registered:
             self.loop.remove_reader(self.master_fd)
             self._reader_registered = False
-        try:
-            os.close(self.master_fd)
-        except OSError:
-            pass
+        if not self._master_closed:
+            self._master_closed = True
+            try:
+                os.close(self.master_fd)
+            except OSError:
+                pass
 
     def _signalable_groups(self) -> set[int]:
-        groups = {self.pid}
+        groups: set[int] = set()
+        # The shell's own group is only a valid target while it is still the
+        # unreaped child; afterwards the pid may belong to another process.
+        if self.status.kind != "exited":
+            groups.add(self.pid)
         foreground = self._foreground_pgid()
         if foreground is not None:
             groups.add(foreground)
@@ -604,16 +717,19 @@ class _PtySession:
             data = os.read(self.master_fd, 8192)
         except BlockingIOError:
             return
-        except OSError as exc:
-            if exc.errno in {errno.EIO, errno.EBADF}:
-                return
-            self._fail_active(None, TerminalError(f"PTY read failed: {exc}", "PTY_READ_FAILED"))
+        except OSError:
+            # EIO/EBADF mean the slave side is gone; stop the reader so the
+            # loop cannot spin.  The wait task reaps the child and closes fd.
+            self._close_master()
             return
         if data:
             self._append_data(data)
 
     def _append_data(self, data: bytes) -> None:
         text, prompt = self.sanitizer.feed(data)
+        self._append_text(text, prompt)
+
+    def _append_text(self, text: str, prompt: bool = False) -> None:
         if not text:
             if prompt:
                 self.prompt_count += 1
@@ -646,9 +762,20 @@ class _PtySession:
                     self.status = _TerminalStatus("exited", None, name)
                 else:
                     self.status = _TerminalStatus("exited", None, None)
-                if self._reader_registered:
-                    self.loop.remove_reader(self.master_fd)
-                    self._reader_registered = False
+                # Drain whatever the PTY still buffers, then release the fd so
+                # a naturally exited session leaks neither descriptor nor
+                # reader callback.
+                while True:
+                    try:
+                        data = os.read(self.master_fd, 8192)
+                    except (BlockingIOError, OSError):
+                        break
+                    if not data:
+                        break
+                    self._append_data(data)
+                tail = self.sanitizer.flush()
+                self._append_text(tail)
+                self._close_master()
                 if self.active is not None:
                     self.active.settle("session_exit")
                 self._exit_event.set()
@@ -719,6 +846,15 @@ class TerminalSessionService:
                 raise TerminalError("PTY service is disposing", "SERVICE_DISPOSING")
             if owner in self._closing_owners:
                 raise TerminalError("PTY owner is being disposed", "OWNER_NOT_LIVE")
+            active = sum(
+                1 for record in self._sessions.values() if record.owner == owner
+            ) + len(self._pending_spawns.get(owner, ()))
+            if active >= self.config.max_sessions_per_owner:
+                raise TerminalError(
+                    f"terminal session limit reached for this owner "
+                    f"({self.config.max_sessions_per_owner})",
+                    "OWNER_LIMIT",
+                )
             if name is not None:
                 duplicate = any(
                     record.owner == owner and record.name == name
@@ -747,6 +883,10 @@ class TerminalSessionService:
             async with self._lock:
                 if self._disposing:
                     raise TerminalError("PTY service is disposing", "SERVICE_DISPOSING")
+                if owner in self._closing_owners:
+                    # The owner began disposing while this spawn was in flight;
+                    # publish nothing and roll the PTY back below.
+                    raise TerminalError("PTY owner is being disposed", "OWNER_NOT_LIVE")
                 record = _TerminalRecord(session_id, owner, name, type, session)
                 self._sessions[session_id] = record
             return self._snapshot(record, motd=motd)
@@ -792,13 +932,13 @@ class TerminalSessionService:
     async def kill(self, owner: str, session_id: str, reason: str = "model request") -> bool:
         record = self._expect_owned(owner, session_id)
         if record.closing is not None:
-            await record.closing
+            await asyncio.shield(record.closing)
             return False
         record.closing = asyncio.create_task(
             record.session.close(reason), name=f"dsh-terminal-kill-{session_id}"
         )
         try:
-            await record.closing
+            await asyncio.shield(record.closing)
         except Exception:
             record.closing = None
             raise
@@ -893,7 +1033,7 @@ class TerminalSessionService:
                 record.closing = asyncio.create_task(
                     record.session.close(reason), name=f"dsh-terminal-close-{record.session_id}"
                 )
-            await record.closing
+            await asyncio.shield(record.closing)
             self._sessions.pop(record.session_id, None)
 
         results = await asyncio.gather(
