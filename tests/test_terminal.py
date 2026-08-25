@@ -15,6 +15,7 @@ from deepseek_harness.tools import (
     PermissionMode,
     ToolContext,
     ToolRegistry,
+    ToolResult,
     WorkspacePolicy,
     install_builtin_tools,
     install_terminal_tools,
@@ -406,5 +407,238 @@ def test_unsupported_platform_has_clear_error(
             await TerminalSessionService().spawn(
                 "unsupported", type="shell", cwd=tmp_path
             )
+
+    asyncio.run(scenario())
+
+
+def test_terminal_natural_exit_releases_fd_and_rejects_signals(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        terminals = TerminalSessionService(_config())
+        registry, disposers = _tools(tmp_path, terminals, owner="natural")
+        context = ToolContext("natural", str(tmp_path))
+        try:
+            opened = await registry.execute("terminal_open", '{"type":"shell"}', context)
+            assert opened.meta is not None
+            pid = int(opened.meta["pid"])
+            sent = await registry.execute(
+                "terminal_send", '{"sessionId":"pty-1","text":"exit"}', context
+            )
+            assert sent.meta is not None
+            assert sent.meta["waitReason"] == "session_exit"
+            assert sent.meta["sessionStatus"]["kind"] == "exited"
+            record = terminals._sessions["pty-1"]
+            assert record.session._master_closed is True
+            listed = await registry.execute("terminal_list", "{}", context)
+            assert listed.meta is not None
+            assert listed.meta["sessions"][0]["status"]["kind"] == "exited"
+            rejected = await registry.execute(
+                "terminal_signal", '{"sessionId":"pty-1","signal":"SIGINT"}', context
+            )
+            assert rejected.is_error
+            assert "exited" in rejected.text
+            closed = await registry.execute("terminal_close", '{"sessionId":"pty-1"}', context)
+            assert closed.meta == {"sessionId": "pty-1", "outcome": "closed"}
+            assert terminals.list("natural") == []
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
+        finally:
+            for dispose in reversed(disposers):
+                dispose()
+
+    asyncio.run(scenario())
+
+
+def test_sanitizer_joins_split_utf8_and_bounds_pending() -> None:
+    from deepseek_harness.terminal import _TerminalSanitizer
+
+    sanitizer = _TerminalSanitizer()
+    raw = "界".encode()
+    first, _ = sanitizer.feed(raw[:1])
+    second, _ = sanitizer.feed(raw[1:])
+    assert "�" not in first + second
+    assert "界" in first + second
+
+    bounded = _TerminalSanitizer()
+    head, _ = bounded.feed(b"\x1b]133;D;0")
+    assert head == ""
+    bulk, _ = bounded.feed(b"x" * 70_000)
+    assert bulk == ""
+    assert len(bounded._pending.encode()) <= 65_536
+    tail, _ = bounded.feed(b"\x07after")
+    assert "after" in tail
+
+
+def test_terminal_enforces_owner_session_quota(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        terminals = TerminalSessionService(_config(max_sessions_per_owner=1))
+        registry, disposers = _tools(tmp_path, terminals, owner="quota")
+        context = ToolContext("quota", str(tmp_path))
+        try:
+            first = await registry.execute("terminal_open", '{"type":"shell"}', context)
+            assert not first.is_error
+            second = await registry.execute("terminal_open", '{"type":"shell"}', context)
+            assert second.is_error
+            assert "limit" in second.text
+        finally:
+            await terminals.close_all()
+            for dispose in reversed(disposers):
+                dispose()
+
+    asyncio.run(scenario())
+
+
+def test_close_owner_rejects_late_spawn_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        import deepseek_harness.terminal as terminal_module
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        original_spawn = terminal_module._PtySession.spawn
+
+        async def delayed_spawn(
+            cls: object,
+            cwd: Path,
+            config: TerminalConfig,
+            session_id: str,
+            owner: str,
+        ) -> object:
+            del cls
+            started.set()
+            await release.wait()
+            return await original_spawn(cwd, config, session_id, owner)
+
+        monkeypatch.setattr(
+            terminal_module._PtySession,
+            "spawn",
+            classmethod(delayed_spawn),
+        )
+        terminals = TerminalSessionService(_config())
+        pending = asyncio.create_task(
+            terminals.spawn("late", type="shell", cwd=tmp_path)
+        )
+        await started.wait()
+        closing = asyncio.create_task(terminals.close_owner("late"))
+        await asyncio.sleep(0)
+        assert not closing.done()
+        release.set()
+        with pytest.raises(Exception, match="disposed"):
+            await pending
+        await closing
+        assert terminals.list("late") == []
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_foreground_send_interrupts_and_frees_slot(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        terminals = TerminalSessionService(_config(idle_seconds=0.1))
+        registry, disposers = _tools(tmp_path, terminals, owner="cancel")
+        context = ToolContext("cancel", str(tmp_path))
+        spam = tmp_path / "spam.py"
+        spam.write_text(
+            "import time\nwhile True:\n    print('x', flush=True)\n    time.sleep(0.05)\n",
+            encoding="utf-8",
+        )
+        try:
+            await registry.execute("terminal_open", '{"type":"shell"}', context)
+            task = asyncio.create_task(
+                registry.execute(
+                    "terminal_send",
+                    json.dumps({"sessionId": "pty-1", "text": f"python3 {spam}"}),
+                    context,
+                )
+            )
+            await asyncio.sleep(0.2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            # The cancelled send interrupts the foreground command and frees
+            # the slot once the shell prompt returns; retry until then.
+            follow: ToolResult | None = None
+            for _ in range(50):
+                follow = await registry.execute(
+                    "terminal_send", '{"sessionId":"pty-1","text":"echo freed"}', context
+                )
+                if not follow.is_error:
+                    break
+                await asyncio.sleep(0.1)
+            assert follow is not None and not follow.is_error
+            assert "freed" in follow.text
+        finally:
+            await terminals.close_all()
+            for dispose in reversed(disposers):
+                dispose()
+
+    asyncio.run(scenario())
+
+
+def test_background_cancel_escalates_past_trapped_sigint(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        terminals = TerminalSessionService(
+            _config(cancel_grace_seconds=0.3, idle_seconds=0.1)
+        )
+        jobs = JobRegistry()
+        registry = ToolRegistry()
+        disposers = [
+            *install_builtin_tools(
+                registry,
+                WorkspacePolicy(tmp_path, PermissionMode.DANGER_FULL_ACCESS),
+                enable_shell=True,
+                jobs=jobs,
+            ),
+            *install_terminal_tools(
+                registry,
+                terminals,
+                WorkspacePolicy(tmp_path, PermissionMode.DANGER_FULL_ACCESS),
+                jobs=jobs,
+                owner_session="escalate",
+            ),
+        ]
+        context = ToolContext("escalate", str(tmp_path))
+        script = tmp_path / "ignore-int.py"
+        script.write_text(
+            "import signal, time\n"
+            "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+            "while True:\n"
+            "    print('x', flush=True)\n"
+            "    time.sleep(0.05)\n",
+            encoding="utf-8",
+        )
+        try:
+            await registry.execute("terminal_open", '{"type":"shell"}', context)
+            started = await registry.execute(
+                "terminal_send",
+                json.dumps(
+                    {
+                        "sessionId": "pty-1",
+                        "text": f"python3 {script}",
+                        "run_in_background": True,
+                    }
+                ),
+                context,
+            )
+            assert started.meta is not None
+            job_id = str(started.meta["jobId"])
+            killed = await registry.execute(
+                "job_kill", json.dumps({"job_id": job_id}), context
+            )
+            assert not killed.is_error
+            output = await asyncio.wait_for(
+                registry.execute(
+                    "job_output",
+                    json.dumps({"job_id": job_id, "wait": True, "timeout_ms": 5000}),
+                    context,
+                ),
+                timeout=8,
+            )
+            assert "[status: killed" in output.text
+        finally:
+            await terminals.close_all()
+            await jobs.close()
+            for dispose in reversed(disposers):
+                dispose()
 
     asyncio.run(scenario())

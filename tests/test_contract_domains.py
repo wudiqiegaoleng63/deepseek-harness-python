@@ -166,7 +166,14 @@ def test_settings_and_credentials_survive_service_restart(tmp_path) -> None:
     asyncio.run(scenario())
 
 
-def test_skill_list_discovers_project_frontmatter_and_filters_model_only_skills(tmp_path) -> None:
+def test_skill_list_discovers_project_frontmatter_and_filters_model_only_skills(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    # Pin the user-level roots so machine-installed skills cannot leak into
+    # the exact-list assertion below.
+    monkeypatch.setenv("DSH_HOME", str(tmp_path / "dsh-home"))
+    monkeypatch.setenv("DSH_AGENTS_HOME", str(tmp_path / "agents-home"))
     skills_root = tmp_path / ".agents" / "skills"
     (skills_root / "review").mkdir(parents=True)
     (skills_root / "review" / "SKILL.md").write_text(
