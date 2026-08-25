@@ -7,13 +7,14 @@ from collections.abc import Callable
 from typing import Any
 
 from ..jobs import JobHandle, JobOutcome, JobRegistry
+from ..sandbox import SandboxExecutionPolicy, SandboxProvider
 from ..terminal import (
     ALLOWED_SIGNALS,
     TerminalSessionService,
     _SendOperation,
     bound_terminal_text,
 )
-from .policy import WorkspacePolicy
+from .policy import PermissionMode, WorkspacePolicy
 from .registry import ToolContext, ToolDefinition, ToolRegistry, ToolResult
 
 MAX_RESULT_BYTES = 256 * 1024
@@ -27,6 +28,7 @@ def install_terminal_tools(
     *,
     jobs: JobRegistry | None = None,
     owner_session: str | None = None,
+    sandbox: SandboxProvider | None = None,
     max_result_bytes: int = MAX_RESULT_BYTES,
 ) -> list[Callable[[], None]]:
     """Install the six TS-compatible terminal tools for one session registry."""
@@ -61,8 +63,25 @@ def install_terminal_tools(
         cwd = policy.assert_readable(raw_cwd or context.cwd)
         if not cwd.is_dir():
             raise ValueError(f"terminal cwd is not a directory: {cwd}")
+        sandbox_provider: SandboxProvider | None = None
+        if policy.mode is PermissionMode.WORKSPACE_WRITE:
+            if sandbox is None or not sandbox.is_available():
+                raise RuntimeError(
+                    "persistent terminals in workspace-write require the bubblewrap "
+                    "sandbox; install bwrap or switch to danger-full-access"
+                )
+            sandbox_provider = sandbox
         result = await terminals.spawn(
-            owner(context), type=raw_type, name=name, cwd=cwd
+            owner(context),
+            type=raw_type,
+            name=name,
+            cwd=cwd,
+            sandbox=sandbox_provider,
+            sandbox_policy=(
+                SandboxExecutionPolicy("workspace-write", str(policy.root))
+                if sandbox_provider is not None
+                else None
+            ),
         )
         motd = result.get("motd") or "(no startup output)"
         label = result["sessionId"] if name is None else f"{result['sessionId']} ({name})"

@@ -443,8 +443,11 @@ def test_service_dispose_waits_for_pending_terminal_startup(
             config: TerminalConfig,
             session_id: str,
             owner: str,
+            *,
+            sandbox: object = None,
+            sandbox_policy: object = None,
         ) -> object:
-            del cls
+            del cls, sandbox, sandbox_policy
             started.set()
             await release.wait()
             return await original_spawn(cwd, config, session_id, owner)
@@ -580,8 +583,11 @@ def test_close_owner_rejects_late_spawn_publication(
             config: TerminalConfig,
             session_id: str,
             owner: str,
+            *,
+            sandbox: object = None,
+            sandbox_policy: object = None,
         ) -> object:
-            del cls
+            del cls, sandbox, sandbox_policy
             started.set()
             await release.wait()
             return await original_spawn(cwd, config, session_id, owner)

@@ -15,7 +15,10 @@ import shutil
 import signal
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
+
+if TYPE_CHECKING:
+    from .sandbox import SandboxExecutionPolicy, SandboxProvider
 
 try:
     import fcntl as _fcntl
@@ -426,6 +429,9 @@ class _PtySession:
         config: TerminalConfig,
         session_id: str,
         owner: str,
+        *,
+        sandbox: SandboxProvider | None = None,
+        sandbox_policy: SandboxExecutionPolicy | None = None,
     ) -> _PtySession:
         if not pty_supported():
             raise PtyUnsupportedError()
@@ -434,6 +440,9 @@ class _PtySession:
             raise TerminalError(
                 f"persistent PTY shell is unavailable: {config.shell}", "SHELL_UNAVAILABLE"
             )
+        argv: list[str] = [shell, *config.shell_args]
+        if sandbox is not None and sandbox_policy is not None:
+            argv = sandbox.confine(argv, sandbox_policy)
         try:
             if _pty is None:
                 raise PtyUnsupportedError()
@@ -460,7 +469,7 @@ class _PtySession:
             )
             try:
                 os.chdir(cwd)
-                os.execvpe(shell, [shell, *config.shell_args], environment)
+                os.execvpe(argv[0], argv, environment)
             except BaseException as exc:
                 try:
                     os.write(2, f"PTY startup failed: {exc}\n".encode("utf-8", "replace"))
@@ -866,6 +875,8 @@ class TerminalSessionService:
         type: str,
         name: str | None = None,
         cwd: str | os.PathLike[str] | None = None,
+        sandbox: SandboxProvider | None = None,
+        sandbox_policy: SandboxExecutionPolicy | None = None,
     ) -> dict[str, Any]:
         if not isinstance(owner, str) or not owner:
             raise TerminalError("terminal owner must be a non-empty session id", "OWNER_NOT_LIVE")
@@ -922,7 +933,14 @@ class TerminalSessionService:
             self._pending_spawns.setdefault(owner, set()).add(pending)
         session: _PtySession | None = None
         try:
-            session = await _PtySession.spawn(path, self.config, session_id, owner)
+            session = await _PtySession.spawn(
+                path,
+                self.config,
+                session_id,
+                owner,
+                sandbox=sandbox,
+                sandbox_policy=sandbox_policy,
+            )
             motd = await session.initialize()
             async with self._lock:
                 if self._disposing:
