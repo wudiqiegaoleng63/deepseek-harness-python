@@ -89,6 +89,14 @@ from .permissions import (
     PermissionPresetManager,
     PermissionProjection,
 )
+from .sandbox import (
+    BubblewrapSandbox,
+    SandboxExecutionPolicy,
+    SandboxMode,
+    SandboxProvider,
+    SandboxUnavailableError,
+    UnavailableSandbox,
+)
 from .sdk import DeepSeekHarness, DeepSeekHarnessConfig
 from .sdk import RunResult as SdkRunResult
 from .sdk_process import (
@@ -229,6 +237,12 @@ __all__ = [
     "PrunedEntry",
     "RunResult",
     "RetryPolicy",
+    "BubblewrapSandbox",
+    "SandboxExecutionPolicy",
+    "SandboxMode",
+    "SandboxProvider",
+    "SandboxUnavailableError",
+    "UnavailableSandbox",
     "SdkRunResult",
     "Session",
     "SessionEvent",

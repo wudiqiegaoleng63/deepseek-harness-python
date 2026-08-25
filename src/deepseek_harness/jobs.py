@@ -334,16 +334,17 @@ async def start_bash_process(
     command: str,
     *,
     cwd: Path,
+    argv: list[str] | None = None,
 ) -> JobHandle:
     """Spawn a detached bash process and expose a JobHandle for it."""
 
-    executable = shutil.which("bash") or shutil.which("sh")
-    if executable is None:
-        raise RuntimeError("a bash-compatible shell is not installed")
+    if argv is None:
+        executable = shutil.which("bash") or shutil.which("sh")
+        if executable is None:
+            raise RuntimeError("a bash-compatible shell is not installed")
+        argv = [executable, "-lc", command]
     process = await asyncio.create_subprocess_exec(
-        executable,
-        "-lc",
-        command,
+        *argv,
         cwd=str(cwd),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

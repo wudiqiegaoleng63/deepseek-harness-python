@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from ..jobs import JobRegistry, start_bash_process
+from ..sandbox import SandboxExecutionPolicy, SandboxProvider
 from .policy import PermissionMode, WorkspacePolicy
 from .registry import ToolDefinition, ToolRegistry, ToolResult
 
@@ -21,6 +22,7 @@ def install_builtin_tools(
     *,
     enable_shell: bool = False,
     jobs: JobRegistry | None = None,
+    sandbox: SandboxProvider | None = None,
 ) -> list[Callable[[], None]]:
     """Install file tools and the shell/job tools for a local agent.
 
@@ -71,7 +73,7 @@ def install_builtin_tools(
     ]
     disposers.extend(_install_filesystem_tools(registry, policy))
     if enable_shell:
-        disposers.extend(install_shell_tools(registry, policy, jobs=jobs))
+        disposers.extend(install_shell_tools(registry, policy, jobs=jobs, sandbox=sandbox))
     return disposers
 
 
@@ -80,12 +82,15 @@ def install_shell_tools(
     policy: WorkspacePolicy,
     *,
     jobs: JobRegistry | None = None,
+    sandbox: SandboxProvider | None = None,
 ) -> list[Callable[[], None]]:
     """Install shell and background-job tools for a live permission mode.
 
     The host can add/remove this capability when a session switches between
     permission presets.  The executor still checks ``WorkspacePolicy`` on
-    every call, so registration is not a security boundary.
+    every call, so registration is not a security boundary.  In
+    ``workspace-write`` mode the sandbox provider must be available; commands
+    are then wrapped with it exactly like the TS runtime.
     """
 
     disposers: list[Callable[[], None]] = []
@@ -112,7 +117,9 @@ def install_shell_tools(
                         "required": ["command"],
                         "additionalProperties": False,
                     },
-                    execute=lambda args, ctx: _run_bash(args, policy, jobs, ctx.session_id),
+                    execute=lambda args, ctx: _run_bash(
+                        args, policy, jobs, ctx.session_id, sandbox
+                    ),
                 )
             )
         )
@@ -292,6 +299,7 @@ async def _run_bash(
     policy: WorkspacePolicy,
     jobs: JobRegistry | None,
     owner_session: str,
+    sandbox: SandboxProvider | None = None,
 ) -> ToolResult:
     policy.assert_shell_allowed()
     command = args.get("command")
@@ -305,6 +313,21 @@ async def _run_bash(
     if not isinstance(raw_workdir, str):
         return ToolResult("workdir must be a string", is_error=True)
     workdir = policy.assert_readable(raw_workdir)
+    executable = shutil.which("bash") or shutil.which("sh")
+    if executable is None:
+        return ToolResult("a bash-compatible shell is not installed", is_error=True)
+    argv: list[str] = [executable, "-lc", command]
+    if policy.mode is PermissionMode.WORKSPACE_WRITE:
+        if sandbox is None or not sandbox.is_available():
+            return ToolResult(
+                "shell in workspace-write requires the bubblewrap sandbox; "
+                "install bwrap or switch to danger-full-access",
+                is_error=True,
+            )
+        argv = sandbox.confine(
+            argv,
+            SandboxExecutionPolicy("workspace-write", str(policy.root)),
+        )
     if args.get("run_in_background") is True:
         if jobs is None:
             return ToolResult(
@@ -316,20 +339,15 @@ async def _run_bash(
                 kind="bash",
                 label=command,
                 owner_session=owner_session,
-                starter=lambda: start_bash_process(command, cwd=workdir),
+                starter=lambda: start_bash_process(command, cwd=workdir, argv=argv),
             )
         except Exception as exc:
             return ToolResult(f"could not start background command: {exc}", is_error=True)
         return ToolResult(
             f"started background job {job_id}\nRead output with job_output; stop it with job_kill."
         )
-    executable = shutil.which("bash") or shutil.which("sh")
-    if executable is None:
-        return ToolResult("a bash-compatible shell is not installed", is_error=True)
     process = await asyncio.create_subprocess_exec(
-        executable,
-        "-lc",
-        command,
+        *argv,
         cwd=str(workdir),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
