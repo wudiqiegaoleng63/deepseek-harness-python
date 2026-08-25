@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 import os
+import platform
 import shutil
 import signal
 from dataclasses import dataclass
@@ -17,9 +18,15 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 try:
+    import fcntl as _fcntl
     import pty as _pty
+    import struct as _struct
+    import termios as _termios
 except ImportError:  # pragma: no cover - exercised on Windows.
+    _fcntl = None
     _pty = None
+    _struct = None
+    _termios = None
 
 TerminalSignal = Literal["SIGINT", "SIGTERM", "SIGKILL", "SIGTSTP", "SIGHUP"]
 TerminalWaitReason = Literal["stdin_read", "inferred_idle", "timeout", "session_exit"]
@@ -56,11 +63,16 @@ class TerminalConfig:
 
     shell: str = "bash"
     shell_args: tuple[str, ...] = ("--noprofile", "--norc", "-i")
+    rows: int = 40
+    cols: int = 160
     max_send_bytes: int = 256 * 1024
     max_read_bytes: int = 256 * 1024
     scrollback_bytes: int = 4 * 1024 * 1024
     scrollback_lines: int = 10_000
-    idle_seconds: float = 0.75
+    poll_seconds: float = 0.05
+    probe_after_seconds: float = 0.15
+    idle_seconds: float = 3.0
+    handoff_grace_seconds: float = 0.5
     send_timeout_seconds: float = 30.0
     startup_timeout_seconds: float = 10.0
     close_grace_seconds: float = 1.0
@@ -69,6 +81,8 @@ class TerminalConfig:
 
     def __post_init__(self) -> None:
         for name in (
+            "rows",
+            "cols",
             "max_send_bytes",
             "max_read_bytes",
             "scrollback_bytes",
@@ -79,7 +93,10 @@ class TerminalConfig:
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
         for name in (
+            "poll_seconds",
+            "probe_after_seconds",
             "idle_seconds",
+            "handoff_grace_seconds",
             "send_timeout_seconds",
             "startup_timeout_seconds",
             "close_grace_seconds",
@@ -431,7 +448,9 @@ class _PtySession:
                     "PAGER": "cat",
                     "GIT_PAGER": "cat",
                     "PS1": "dsh> ",
-                    "PROMPT_COMMAND": "printf \\\"\\033]133;D;%s\\007\\\" \\\"$?\\\"",
+                    # Single quotes survive into the format string so printf
+                    # itself expands \033/\007 into the OSC prompt marker.
+                    "PROMPT_COMMAND": "printf '\\033]133;D;%s\\007' \"$?\"",
                     "HISTFILE": "/dev/null",
                     "BASH_SILENCE_DEPRECATION_WARNING": "1",
                     "DSH_SHELL": "1",
@@ -448,6 +467,7 @@ class _PtySession:
                 finally:
                     os._exit(127)
         os.set_blocking(master_fd, False)
+        cls._apply_window_size(master_fd, config)
         try:
             return cls(pid, master_fd, config)
         except BaseException as exc:
@@ -465,6 +485,16 @@ class _PtySession:
             except OSError:
                 pass
             raise exc
+
+    @staticmethod
+    def _apply_window_size(master_fd: int, config: TerminalConfig) -> None:
+        if _fcntl is None or _termios is None or _struct is None:
+            return
+        try:
+            winsize = _struct.pack("HHHH", config.rows, config.cols, 0, 0)
+            _fcntl.ioctl(master_fd, _termios.TIOCSWINSZ, winsize)
+        except OSError:
+            pass
 
     async def initialize(self) -> str:
         operation = self.start_send(text="", submit=False)
@@ -520,21 +550,35 @@ class _PtySession:
                 self.active = None
 
     async def _wait_for_send(self, operation: _SendOperation) -> None:
-        deadline = self.loop.time() + self.config.send_timeout_seconds
+        deadline = operation.started_at + self.config.send_timeout_seconds
         while not operation.done.done():
             if self.status.kind == "exited":
                 operation.settle("session_exit")
                 break
             now = self.loop.time()
+            prompt_seen = self.prompt_count > operation.start_prompt_count
+            foreground = self._foreground_pgid()
+            if prompt_seen and foreground == self.pid:
+                operation.settle("stdin_read")
+                break
+            # Exact probe: a foreground process genuinely blocked in a tty
+            # read is waiting for input, marker or not.  Mirrors the TS
+            # exactProbeAfterMs behaviour.
             if (
-                self.prompt_count > operation.start_prompt_count
-                and self._foreground_pgid() == self.pid
+                now - operation.started_at >= self.config.probe_after_seconds
+                and foreground is not None
+                and _stdin_waiting(foreground)
             ):
                 operation.settle("stdin_read")
                 break
+            idle_bound = self.config.idle_seconds
+            if prompt_seen:
+                # A prompt marker can race the kernel's foreground handoff;
+                # hold the idle fallback for the grace window (TS handoffGraceMs).
+                idle_bound += self.config.handoff_grace_seconds
             if (
                 self.output_count > operation.start_output_count
-                and now - self.last_output_at >= self.config.idle_seconds
+                and now - self.last_output_at >= idle_bound
             ):
                 operation.settle("inferred_idle")
                 break
@@ -542,9 +586,9 @@ class _PtySession:
                 operation.settle("timeout")
                 break
             timeout = min(
-                0.1,
-                max(0.01, deadline - now),
-                max(0.01, self.config.idle_seconds - (now - self.last_output_at)),
+                self.config.poll_seconds,
+                max(0.005, deadline - now),
+                max(0.005, idle_bound - (now - self.last_output_at)),
             )
             self._output_event.clear()
             self._exit_event.clear()
@@ -1043,6 +1087,127 @@ class TerminalSessionService:
         if clear:
             self._sessions.clear()
         return errors
+
+
+_SYSCALL_TABLES: dict[str, dict[str, int]] = {
+    "x86_64": {
+        "read": 0,
+        "select": 23,
+        "pselect": 270,
+        "poll": 7,
+        "ppoll": 271,
+        "epoll_wait": 232,
+        "epoll_pwait": 281,
+    },
+    "aarch64": {"read": 63, "pselect": 72, "ppoll": 73, "epoll_pwait": 22},
+}
+
+
+def _read_process_memory(pid: int, address: int, length: int) -> bytes | None:
+    try:
+        fd = os.open(f"/proc/{pid}/mem", os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        return os.pread(fd, length, address)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _fd_set_has_stdin(pid: int, address: int) -> bool:
+    if address == 0:
+        return False
+    memory = _read_process_memory(pid, address, 8)
+    return memory is not None and len(memory) >= 1 and memory[0] % 2 == 1
+
+
+def _poll_has_stdin(pid: int, address: int, count: int) -> bool:
+    if address == 0 or count <= 0:
+        return False
+    memory = _read_process_memory(pid, address, min(count, 1024) * 8)
+    if memory is None:
+        return False
+    for offset in range(0, len(memory) - 7, 8):
+        fd = int.from_bytes(memory[offset : offset + 4], "little", signed=True)
+        events = int.from_bytes(memory[offset + 4 : offset + 6], "little")
+        if fd == 0 and events & 0x001:
+            return True
+    return False
+
+
+def _epoll_has_stdin(pid: int, epfd: int) -> bool:
+    try:
+        info = Path(f"/proc/{pid}/fdinfo/{epfd}").read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return False
+    for line in info.splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 2 and parts[0] == "tfd:" and parts[1] == "0":
+            return True
+    return False
+
+
+def _syscall_waits_on_stdin(pid: int, fields: list[str], table: dict[str, int]) -> bool:
+    if fields[0] == "running" or fields[0] == "-1":
+        return False
+    try:
+        number = int(fields[0])
+        args = [int(value, 16) for value in fields[1:7]]
+    except (ValueError, IndexError):
+        return False
+    if number == table["read"]:
+        return args[0] == 0
+    if number in {table.get("select"), table.get("pselect")}:
+        return args[0] >= 1 and _fd_set_has_stdin(pid, args[1])
+    if number in {table.get("poll"), table.get("ppoll")}:
+        return args[1] >= 1 and _poll_has_stdin(pid, args[0], args[1])
+    if number in {table.get("epoll_wait"), table.get("epoll_pwait")}:
+        return args[2] >= 1 and _epoll_has_stdin(pid, args[0])
+    return False
+
+
+def _stdin_waiting(pgid: int) -> bool:
+    """Report whether any process in ``pgid`` waits on stdin.
+
+    A faithful port of the TS process inspector: the per-architecture syscall
+    table classifies the blocked syscall, and select/poll sets plus epoll
+    interest are verified through ``/proc/<pid>/mem`` and ``fdinfo``.
+    """
+
+    table = _SYSCALL_TABLES.get(platform.machine())
+    if table is None:
+        return False
+    proc = Path("/proc")
+    try:
+        entries = list(proc.iterdir())
+    except OSError:
+        return False
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text(encoding="ascii", errors="replace")
+            end = stat.rfind(")")
+            fields = stat[end + 2 :].split()
+            if int(fields[2]) != pgid:
+                continue
+            pid = int(entry.name)
+            tasks = entry / "task"
+            task_ids = [item for item in tasks.iterdir() if item.name.isdigit()]
+            if not task_ids:
+                task_ids = [entry]
+            for task in task_ids:
+                try:
+                    syscall = (task / "syscall").read_text(encoding="ascii").split()
+                except (OSError, ValueError):
+                    continue
+                if _syscall_waits_on_stdin(pid, syscall, table):
+                    return True
+        except (OSError, ValueError, IndexError):
+            continue
+    return False
 
 
 def _descendant_pids(root_pid: int) -> set[int]:
