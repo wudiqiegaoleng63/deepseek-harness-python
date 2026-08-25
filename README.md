@@ -178,12 +178,15 @@ It reads and writes one JSON-RPC object per line on stdin/stdout. Configure
 the provider with `--api-key`, `--base-url`, and `--request-timeout`, or use
 the matching `DEEPSEEK_API_KEY` and `DEEPSEEK_BASE_URL` environment variables.
 
-Shell execution is deliberately disabled in `read-only` and `workspace-write`
-sessions until the platform sandbox provider is implemented. The shell/job
-and persistent terminal tools are added when a session selects
-`danger-full-access`, and are still guarded by the live workspace policy; use
-`--permission-mode danger-full-access` for a headless session that explicitly
-opts into direct shell execution.
+Shell execution is disabled in `read-only` sessions. In `workspace-write`
+sessions, shell and persistent terminal tools are registered when the
+bubblewrap sandbox (`bwrap`) is available: every command runs under the same
+profile as the TypeScript runtime (read-only root bind, private `/tmp`,
+read-write workspace bind, `--die-with-parent`), so writes outside the
+workspace fail inside the sandbox. Without `bwrap`, those tools stay
+unregistered and the session behaves as before; set `DSH_SANDBOX=off` to
+disable detection explicitly. `danger-full-access` keeps running tools
+unconfined.
 
 Persistent terminals use a POSIX PTY running `bash --noprofile --norc -i`.
 Their shell state survives across `terminal_send` calls, including `cd`, and

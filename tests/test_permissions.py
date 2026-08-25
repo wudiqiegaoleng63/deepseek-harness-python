@@ -6,6 +6,7 @@ from deepseek_harness.permissions import (
     CUSTOM_PERMISSION_PRESET,
     PermissionPresetManager,
 )
+from deepseek_harness.sandbox import UnavailableSandbox
 from deepseek_harness.session import Session
 from deepseek_harness.tools import PermissionMode
 from deepseek_harness.tools.registry import ToolContext
@@ -50,7 +51,9 @@ def test_permission_preset_fold_and_projection_match_shared_contract() -> None:
 def test_service_permission_switch_projects_persists_and_reconfigures_shell(tmp_path) -> None:
     async def scenario() -> None:
         state = tmp_path / "state"
-        service = HarnessService(state, cwd=tmp_path)
+        # Pin the sandbox off so the workspace-write assertions below describe
+        # the no-sandbox deployment; sandbox-enabled behavior has its own tests.
+        service = HarnessService(state, cwd=tmp_path, sandbox_provider=UnavailableSandbox())
         handle = await service.create_session(session_id="permission-service", cwd=str(tmp_path))
         assert "bash" not in service._tool_registries[handle.session.id].names()
         initial = (await service.history(handle.session.id))["projections"]["values"]
@@ -86,7 +89,7 @@ def test_service_permission_switch_projects_persists_and_reconfigures_shell(tmp_
         ]
         await service.dispose()
 
-        resumed = HarnessService(state, cwd=tmp_path)
+        resumed = HarnessService(state, cwd=tmp_path, sandbox_provider=UnavailableSandbox())
         resumed_handle = await resumed.get_session(handle.session.id)
         assert resumed_handle.policy.mode is PermissionMode.WORKSPACE_WRITE
         assert "bash" not in resumed._tool_registries[handle.session.id].names()

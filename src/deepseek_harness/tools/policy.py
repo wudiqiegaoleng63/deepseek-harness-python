@@ -58,12 +58,16 @@ class WorkspacePolicy:
         return path
 
     def assert_shell_allowed(self) -> None:
+        """Reject shell effects the policy cannot honor at all.
+
+        ``read-only`` has no writable sink for shell state, so it is rejected
+        here.  ``workspace-write`` is allowed conditionally: call sites must
+        confine execution through a sandbox provider and fail closed when one
+        is unavailable, mirroring the TS sandbox seam.
+        """
+
         if self.mode is PermissionMode.READ_ONLY:
             raise PermissionError("shell execution is disabled in read-only mode")
-        if self.mode is PermissionMode.WORKSPACE_WRITE:
-            raise PermissionError(
-                "shell execution requires a platform sandbox or danger-full-access mode"
-            )
 
     def set_mode(self, mode: PermissionMode) -> None:
         """Change the live session mode after a durable permission event."""

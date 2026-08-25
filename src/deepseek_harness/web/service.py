@@ -45,6 +45,7 @@ from ..permissions import (
 )
 from ..plans import fold as fold_plan_mode
 from ..plans import has_open_turn
+from ..sandbox import BubblewrapSandbox, SandboxProvider
 from ..session import JsonlSessionStore, Session, SessionEvent
 from ..session_title import (
     SessionTitleInvalidError,
@@ -208,6 +209,7 @@ class HarnessService:
         agent_instructions_max_source_bytes: int = 1_048_576,
         dsh_home: str | os.PathLike[str] | None = None,
         tools_mode: Literal["native", "code", "both"] | None = None,
+        sandbox_provider: SandboxProvider | None = None,
     ) -> None:
         self.store = JsonlSessionStore(session_root)
         state_root = self.store.root
@@ -345,6 +347,12 @@ class HarnessService:
         self._host_subscribers: set[asyncio.Queue[Frame]] = set()
         self.jobs = JobRegistry(on_changed=self._jobs_changed)
         self.terminals = TerminalSessionService()
+        if sandbox_provider is not None:
+            self.sandbox: SandboxProvider | None = sandbox_provider
+        elif os.getenv("DSH_SANDBOX", "auto") == "off":
+            self.sandbox = None
+        else:
+            self.sandbox = BubblewrapSandbox()
         self.dynamic = DynamicCordisService(
             tool_registries=self._tool_registries,
             remote_event=self._publish_remote_event,
@@ -3985,6 +3993,9 @@ class HarnessService:
             return default
         return self.permissions.fold(session.events).mode or default
 
+    def _sandbox_ready(self) -> bool:
+        return self.sandbox is not None and self.sandbox.is_available()
+
     def _set_shell_tools(
         self,
         registry: ToolRegistry,
@@ -3994,16 +4005,21 @@ class HarnessService:
         jobs: JobRegistry,
         owner_session: str,
     ) -> list[Callable[[], None]]:
-        if mode is not PermissionMode.DANGER_FULL_ACCESS:
+        if mode is PermissionMode.DANGER_FULL_ACCESS:
+            sandbox = None
+        elif mode is PermissionMode.WORKSPACE_WRITE and self._sandbox_ready():
+            sandbox = self.sandbox
+        else:
             return []
         return [
-            *install_shell_tools(registry, policy, jobs=jobs),
+            *install_shell_tools(registry, policy, jobs=jobs, sandbox=sandbox),
             *install_terminal_tools(
                 registry,
                 self.terminals,
                 policy,
                 jobs=jobs,
                 owner_session=owner_session,
+                sandbox=sandbox,
             ),
         ]
 

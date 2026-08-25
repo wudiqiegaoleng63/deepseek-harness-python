@@ -10,6 +10,7 @@ import pytest
 
 from deepseek_harness.jobs import JobRegistry
 from deepseek_harness.llm.types import LlmRequest, StreamChunk
+from deepseek_harness.sandbox import BubblewrapSandbox, UnavailableSandbox
 from deepseek_harness.terminal import PtyUnsupportedError, TerminalConfig, TerminalSessionService
 from deepseek_harness.tools import (
     PermissionMode,
@@ -376,6 +377,7 @@ def test_service_only_registers_terminals_in_danger_mode(tmp_path: Path) -> None
             tmp_path / "state",
             cwd=tmp_path,
             adapter_factory=lambda _model: _Adapter(),
+            sandbox_provider=UnavailableSandbox(),
         )
         handle = await service.create_session(session_id="permission", cwd=str(tmp_path))
         try:
@@ -470,6 +472,35 @@ def test_service_dispose_waits_for_pending_terminal_startup(
             await pending
         await disposing
         assert terminals.list("pending") == []
+
+    asyncio.run(scenario())
+
+
+def test_service_registers_workspace_write_terminals_under_sandbox(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        service = HarnessService(
+            tmp_path / "state",
+            cwd=tmp_path,
+            adapter_factory=lambda _model: _Adapter(),
+            sandbox_provider=BubblewrapSandbox(),
+        )
+        handle = await service.create_session(session_id="sandboxed", cwd=str(tmp_path))
+        try:
+            registry = service._tool_registries[handle.session.id]
+            assert "terminal_open" in registry.names()
+            opened = await registry.execute(
+                "terminal_open", '{"type":"shell"}', ToolContext("sandboxed", str(tmp_path))
+            )
+            assert not opened.is_error
+            sent = await registry.execute(
+                "terminal_send",
+                '{"sessionId":"pty-1","text":"pwd"}',
+                ToolContext("sandboxed", str(tmp_path)),
+            )
+            assert not sent.is_error
+            assert str(tmp_path) in sent.text
+        finally:
+            await service.dispose()
 
     asyncio.run(scenario())
 
