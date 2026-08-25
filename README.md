@@ -190,9 +190,12 @@ Their shell state survives across `terminal_send` calls, including `cd`, and
 sessions are isolated by Harness session ownership. The six compatible tools
 are `terminal_open`, `terminal_send`, `terminal_read`, `terminal_list`,
 `terminal_signal`, and `terminal_close`; background sends reuse `job_output`
-and `job_kill`. PTY support is intentionally not emulated on Windows or other
-platforms without POSIX PTYs, where the tools return an explicit capability
-error.
+and `job_kill`. Send readiness mirrors the TypeScript runtime: an OSC prompt
+marker plus a foreground check settles `stdin_read`, a `/proc` syscall probe
+detects processes genuinely blocked on stdin, and output silence falls back to
+`inferred_idle`. Terminals are created at 40x160 like the TS default. PTY
+support is intentionally not emulated on Windows or other platforms without
+POSIX PTYs, where the tools return an explicit capability error.
 
 ## Frontend and compatibility
 

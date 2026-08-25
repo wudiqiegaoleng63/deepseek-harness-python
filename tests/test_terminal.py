@@ -89,6 +89,8 @@ def test_terminal_persists_shell_state_and_reads_bounded_pages(tmp_path: Path) -
             )
             assert not first.is_error
             assert str(tmp_path) in first.text
+            assert first.meta is not None
+            assert first.meta["waitReason"] == "stdin_read"
 
             changed = await registry.execute(
                 "terminal_send",
@@ -191,11 +193,11 @@ def test_terminal_rejects_concurrent_send_and_supports_signals(tmp_path: Path) -
     asyncio.run(scenario())
 
 
-def test_terminal_does_not_treat_nested_prompt_as_shell_readiness(tmp_path: Path) -> None:
+def test_terminal_exact_probe_settles_repl_stdin_read(tmp_path: Path) -> None:
     async def scenario() -> None:
-        terminals = TerminalSessionService(_config(idle_seconds=0.1))
-        registry, disposers = _tools(tmp_path, terminals, owner="nested")
-        context = ToolContext("nested", str(tmp_path))
+        terminals = TerminalSessionService(_config(idle_seconds=5.0))
+        registry, disposers = _tools(tmp_path, terminals, owner="repl")
+        context = ToolContext("repl", str(tmp_path))
         try:
             await registry.execute("terminal_open", '{"type":"shell"}', context)
             result = await registry.execute(
@@ -205,7 +207,81 @@ def test_terminal_does_not_treat_nested_prompt_as_shell_readiness(tmp_path: Path
             )
             assert not result.is_error
             assert result.meta is not None
+            # The nested interactive bash blocks on a tty read; the exact
+            # probe settles stdin_read instead of waiting for silence.
+            assert result.meta["waitReason"] == "stdin_read"
+        finally:
+            await terminals.close_all()
+            for dispose in reversed(disposers):
+                dispose()
+
+    asyncio.run(scenario())
+
+
+def test_terminal_long_running_command_is_not_reported_as_stdin_read(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        terminals = TerminalSessionService(_config(idle_seconds=0.15))
+        registry, disposers = _tools(tmp_path, terminals, owner="long")
+        context = ToolContext("long", str(tmp_path))
+        try:
+            await registry.execute("terminal_open", '{"type":"shell"}', context)
+            result = await registry.execute(
+                "terminal_send",
+                '{"sessionId":"pty-1","text":"sleep 1"}',
+                context,
+            )
+            assert not result.is_error
+            assert result.meta is not None
+            # sleep blocks in a timer, never in a tty read, so the exact
+            # probe must not claim stdin readiness; silence settles idle.
             assert result.meta["waitReason"] == "inferred_idle"
+        finally:
+            await terminals.close_all()
+            for dispose in reversed(disposers):
+                dispose()
+
+    asyncio.run(scenario())
+
+
+def test_terminal_sets_window_size_for_tty_programs(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        terminals = TerminalSessionService(_config())
+        registry, disposers = _tools(tmp_path, terminals, owner="winsize")
+        context = ToolContext("winsize", str(tmp_path))
+        try:
+            await registry.execute("terminal_open", '{"type":"shell"}', context)
+            result = await registry.execute(
+                "terminal_send",
+                '{"sessionId":"pty-1","text":"stty size"}',
+                context,
+            )
+            assert not result.is_error
+            assert "40 160" in result.text
+        finally:
+            await terminals.close_all()
+            for dispose in reversed(disposers):
+                dispose()
+
+    asyncio.run(scenario())
+
+
+def test_terminal_input_read_blocks_in_exact_stdin_probe(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        terminals = TerminalSessionService(_config(idle_seconds=5.0))
+        registry, disposers = _tools(tmp_path, terminals, owner="stdin")
+        context = ToolContext("stdin", str(tmp_path))
+        try:
+            await registry.execute("terminal_open", '{"type":"shell"}', context)
+            result = await registry.execute(
+                "terminal_send",
+                """{"sessionId":"pty-1","text":"python3 -c 'input()'"}""",
+                context,
+            )
+            assert not result.is_error
+            assert result.meta is not None
+            # A python process blocked in read(0) is genuinely waiting for
+            # input; the probe settles long before the idle bound could fire.
+            assert result.meta["waitReason"] == "stdin_read"
         finally:
             await terminals.close_all()
             for dispose in reversed(disposers):
