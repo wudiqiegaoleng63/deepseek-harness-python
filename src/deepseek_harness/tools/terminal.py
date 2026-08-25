@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Any
 
@@ -94,7 +95,7 @@ def install_terminal_tools(
                 async def finish() -> JobOutcome:
                     nonlocal cancelled
                     try:
-                        result = await operation.done
+                        result = await asyncio.shield(operation.done)
                     except Exception as exc:
                         return JobOutcome("failed", str(exc))
                     detail = _send_detail(result)
@@ -121,7 +122,7 @@ def install_terminal_tools(
             return ToolResult(f"started background job {job_id}", meta=value)
 
         operation = terminals.start_send(current_owner, target, text=text, submit=submit)
-        result = await operation.done
+        result = await operation.join()
         value = {"kind": "foreground", **result}
         return ToolResult(_render_send(result, max_result_bytes), meta=value)
 

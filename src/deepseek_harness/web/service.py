@@ -129,6 +129,7 @@ class SessionHandle:
     shell_disposers: list[Callable[[], None]] = field(default_factory=list)
     task: asyncio.Task[Any] | None = None
     queue: list[QueueItem] = field(default_factory=list)
+    terminal_teardown: asyncio.Task[None] | None = None
 
 
 @dataclass(slots=True)
@@ -1476,6 +1477,11 @@ class HarnessService:
                     {"preset": preset, "available": list(self.permissions.names)},
                 ) from exc
             await self.store.save(handle.session)
+            # A downgrade tears live terminals down asynchronously; the RPC
+            # must not report success while PTY processes are still running.
+            teardown = handle.terminal_teardown
+            if teardown is not None:
+                await asyncio.shield(teardown)
             return {"permissions": self._permission_projection(handle.session)}
         if method == "plan.set":
             session_id = self._required_string(payload, "sessionId")
@@ -1950,8 +1956,13 @@ class HarnessService:
         if title_tasks:
             await asyncio.gather(*title_tasks, return_exceptions=True)
         self._session_title_tasks.clear()
-        await self.terminals.close_all()
         handles = tuple(self._handles.values())
+        await self.terminals.close_all()
+        teardown_tasks = [
+            handle.terminal_teardown for handle in handles if handle.terminal_teardown is not None
+        ]
+        if teardown_tasks:
+            await asyncio.gather(*teardown_tasks, return_exceptions=True)
         for handle in handles:
             if handle.task is not None and not handle.task.done():
                 handle.task.cancel()
@@ -3943,16 +3954,30 @@ class HarnessService:
                 dispose()
             handle.shell_disposers.clear()
             if self.terminals.has_owner_activity(handle.session.id):
-                task = asyncio.create_task(
+                handle.terminal_teardown = asyncio.create_task(
                     self.terminals.close_owner(handle.session.id, "permission mode changed")
                 )
-                task.add_done_callback(
-                    lambda completed: (
-                        None
-                        if completed.cancelled()
-                        else completed.exception()
+                handle.terminal_teardown.add_done_callback(
+                    lambda completed, handle=handle: self._on_terminal_teardown_done(
+                        handle, completed
                     )
                 )
+
+    def _on_terminal_teardown_done(
+        self,
+        handle: SessionHandle,
+        completed: asyncio.Task[None],
+    ) -> None:
+        handle.terminal_teardown = None
+        if completed.cancelled():
+            return
+        exc = completed.exception()
+        if exc is not None:
+            event = handle.session.append(
+                "command/error",
+                {"name": "terminal", "message": f"terminal teardown failed: {exc}"},
+            )
+            self._publish_event(handle.session.id, event)
 
     def _effective_permission_mode(self, session: Session | None = None) -> PermissionMode:
         default = self._default_permission_mode()
