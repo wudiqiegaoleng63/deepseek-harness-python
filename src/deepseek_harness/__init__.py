@@ -25,6 +25,15 @@ from .compaction import (
     estimate_messages_tokens,
 )
 from .errors import LlmFailure, LspError, WebError
+from .guards import (
+    DEFAULT_ARGUMENTS_PREVIEW_CHARS,
+    DEFAULT_THRESHOLDS,
+    GENTLE_REMINDER,
+    RepeatToolGuard,
+    canonicalize,
+    detailed_reminder,
+    validate_thresholds,
+)
 from .hooks import (
     CLAUDE_EVENTS,
     DEFAULT_HOOK_TIMEOUT_MS,
@@ -146,6 +155,7 @@ from .sdk_process import (
     ProcessSession,
 )
 from .session import JsonlSessionStore, Session, SessionEvent, SessionHeader, SessionSurfaceNode
+from .session_query import SessionSearchIndex, documents_from_messages
 from .session_title import (
     SessionTitleConfig,
     SessionTitleInvalidError,
@@ -182,6 +192,7 @@ from .terminal import (
     bound_terminal_text,
     pty_supported,
 )
+from .time_context import TimeContextInjector, format_duration, format_timestamp
 from .tool_result_pruner import (
     DEFAULT_TOOL_RESULT_PRUNE_CONFIG,
     PRUNE_MARKER,
@@ -276,6 +287,18 @@ __all__ = [
     "RunResult",
     "RetryPolicy",
     "CLAUDE_EVENTS",
+    "DEFAULT_ARGUMENTS_PREVIEW_CHARS",
+    "DEFAULT_THRESHOLDS",
+    "GENTLE_REMINDER",
+    "RepeatToolGuard",
+    "canonicalize",
+    "detailed_reminder",
+    "validate_thresholds",
+    "SessionSearchIndex",
+    "documents_from_messages",
+    "TimeContextInjector",
+    "format_duration",
+    "format_timestamp",
     "DEFAULT_HOOK_TIMEOUT_MS",
     "DEFAULT_STDERR_SUMMARY_MAX_CHARS",
     "CommandHook",
