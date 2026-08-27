@@ -74,6 +74,10 @@ The native Python host now contains:
   include/exclude, user turns reset the chain) without vetoing any call;
 - opt-in time context (`time_context_zone`): eligible model steps gain a
   durable, plugin-sourced clock reading with refresh throttling;
+- MCP client bridge (stdio): `McpStdioConfig` servers register their tools
+  under `mcp__<serverName>__<rawName>` with DeepSeek-name normalization and
+  identity hashing; one shared client process per server name, contained or
+  fail-loud startup per config;
 - optional SQLite FTS5 session retrieval (`DSH_SESSION_QUERY_PATH=auto` or a
   path): `session.search` answers from the durable index across cold sessions
   and falls back to in-memory search whenever the index is unavailable;

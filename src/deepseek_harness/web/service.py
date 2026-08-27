@@ -40,6 +40,7 @@ from ..jobs import JobHandle, JobOutcome, JobRegistry
 from ..llm import DeepSeekAdapter, LlmCallConfig, RetryPolicy
 from ..llm.adapter import LlmAdapter
 from ..lsp import LspRuntime, install_lsp_tools
+from ..mcp import McpStdioConfig, McpTool, connect_mcp_server, install_mcp_tools
 from ..message_feedback import MessageFeedbackManager
 from ..metrics import (
     context_breakdown_projection,
@@ -230,6 +231,7 @@ class HarnessService:
         repeat_guard_thresholds: tuple[int, ...] | None = (3, 5, 8),
         time_context_zone: str | None = None,
         time_context_refresh_seconds: float | None = None,
+        mcp_servers: tuple[McpStdioConfig, ...] = (),
     ) -> None:
         self.store = JsonlSessionStore(session_root)
         state_root = self.store.root
@@ -421,6 +423,15 @@ class HarnessService:
         )
         self._schedule_runtime_started = False
         self._hook_tasks: set[asyncio.Task[None]] = set()
+        self._mcp_configs: dict[str, McpStdioConfig] = {}
+        for config in mcp_servers:
+            if config.server_name in self._mcp_configs:
+                raise ValueError(
+                    f'mcp serverName "{config.server_name}" is configured more than once'
+                )
+            self._mcp_configs[config.server_name] = config
+        self._mcp_clients: dict[str, Any] = {}
+        self._mcp_tools: dict[str, list[McpTool]] = {}
         if sandbox_provider is not None:
             self.sandbox: SandboxProvider | None = sandbox_provider
         elif os.getenv("DSH_SANDBOX", "auto") == "off":
@@ -478,6 +489,7 @@ class HarnessService:
                 self._check_session_cwd(session, resolved_cwd)
                 self._check_session_preset(session, agent_preset)
             handle = self._attach(session)
+        await self._connect_mcp_tools(session)
         self._ensure_schedule_runtime()
         if self.hooks is not None and self.hooks.loaded:
             self._fire_session_start_hook(handle)
@@ -2170,6 +2182,12 @@ class HarnessService:
         if self._hook_tasks:
             await asyncio.gather(*self._hook_tasks, return_exceptions=True)
         await self._schedule_runtime.stop()
+        if self._mcp_clients:
+            await asyncio.gather(
+                *(client.close() for client in self._mcp_clients.values()),
+                return_exceptions=True,
+            )
+            self._mcp_clients.clear()
         handles = tuple(self._handles.values())
         await self.terminals.close_all()
         teardown_tasks = [
@@ -4119,6 +4137,33 @@ class HarnessService:
         agent.subscribe(lambda event: self._on_agent_event(session, event))
         self._handles[session.id] = handle
         return handle
+
+    async def _connect_mcp_tools(self, session: Session) -> None:
+        """Attach every configured MCP server's tools to one session registry.
+
+        One client process per server name is shared across sessions; a
+        contained startup failure contributes no tools unless
+        ``fail_on_startup_error`` is set.
+        """
+
+        registry = self._tool_registries.get(session.id)
+        handle = self._handles.get(session.id)
+        if registry is None or handle is None:
+            return
+        for name, config in self._mcp_configs.items():
+            client = self._mcp_clients.get(name)
+            try:
+                if client is None or not getattr(client, "connected", False):
+                    client, tools = await connect_mcp_server(config)
+                    self._mcp_clients[name] = client
+                    self._mcp_tools[name] = tools
+                else:
+                    tools = self._mcp_tools.setdefault(name, [])
+                handle.disposers.extend(install_mcp_tools(registry, client, tools))
+            except Exception:
+                if config.fail_on_startup_error:
+                    raise
+                continue
 
     async def _instruction_provider(self, session: Session) -> Message | None:
         """Compose workspace instructions with the optional time context."""
