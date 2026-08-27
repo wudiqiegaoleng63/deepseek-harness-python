@@ -63,6 +63,12 @@ The native Python host now contains:
   `schedule_delete`) with the TS `schedule/change` event fold, offset or
   zoned absolute targets, creation-anchored fixed-rate rules of at least five
   minutes, and follow-up turns framed exactly like the TS runtime;
+- Claude Code command-hook compatibility: point `DSH_HOOKS_CONFIG` (or the
+  `hooks_config_path` option) at a `hooks.json` or settings file and the
+  `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `Stop`
+  command hooks run with the CC payload dialect, matcher semantics, exit-code
+  contract, and deny/ask/allow precedence; `hook/invoked` and `hook/result`
+  events are recorded in the session log;
 - workspace-write shell and persistent terminals confined through the
   bubblewrap sandbox (read-only root bind, private `/tmp`, read-write
   workspace bind) with fail-closed behavior when `bwrap` is absent;

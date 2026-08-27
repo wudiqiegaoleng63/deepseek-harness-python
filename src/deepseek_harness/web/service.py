@@ -26,6 +26,14 @@ from ..compaction import CompactionPolicy, ManualCompactionError
 from ..dynamic_cordis import DynamicCordisService, install_dynamic_tools
 from ..errors import HarnessError
 from ..goals import GoalError, GoalManager
+from ..hooks import (
+    HookBridge,
+    HookConfigError,
+    MergedHookOutcome,
+    blocks_to_text,
+    post_tool_use_hook,
+    pre_tool_use_hook,
+)
 from ..instructions import WorkspaceInstructionLoader
 from ..jobs import JobHandle, JobOutcome, JobRegistry
 from ..llm import DeepSeekAdapter, LlmCallConfig, RetryPolicy
@@ -132,6 +140,7 @@ class SessionHandle:
     task: asyncio.Task[Any] | None = None
     queue: list[QueueItem] = field(default_factory=list)
     terminal_teardown: asyncio.Task[None] | None = None
+    pending_hook_context: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -211,6 +220,9 @@ class HarnessService:
         dsh_home: str | os.PathLike[str] | None = None,
         tools_mode: Literal["native", "code", "both"] | None = None,
         sandbox_provider: SandboxProvider | None = None,
+        hooks_config_path: str | os.PathLike[str] | None = None,
+        hooks_project_dir: str | os.PathLike[str] | None = None,
+        hooks_plugin_root: str | os.PathLike[str] | None = None,
     ) -> None:
         self.store = JsonlSessionStore(session_root)
         state_root = self.store.root
@@ -348,6 +360,25 @@ class HarnessService:
         self._host_subscribers: set[asyncio.Queue[Frame]] = set()
         self.jobs = JobRegistry(on_changed=self._jobs_changed)
         self.terminals = TerminalSessionService()
+        resolved_hooks_config = hooks_config_path or os.getenv("DSH_HOOKS_CONFIG")
+        self.hooks: HookBridge | None = None
+        if resolved_hooks_config:
+            try:
+                self.hooks = HookBridge(
+                    str(Path(resolved_hooks_config).expanduser()),
+                    plugin_root=(
+                        str(Path(hooks_plugin_root).expanduser())
+                        if hooks_plugin_root is not None
+                        else None
+                    ),
+                    project_dir=(
+                        str(Path(hooks_project_dir).expanduser())
+                        if hooks_project_dir is not None
+                        else None
+                    ),
+                )
+            except HookConfigError:
+                self.hooks = None
         self.schedules = ScheduleManager()
         self._schedule_runtime = ScheduleRuntime(
             self.schedules,
@@ -360,6 +391,7 @@ class HarnessService:
             send=self._deliver_schedule_reminder,
         )
         self._schedule_runtime_started = False
+        self._hook_tasks: set[asyncio.Task[None]] = set()
         if sandbox_provider is not None:
             self.sandbox: SandboxProvider | None = sandbox_provider
         elif os.getenv("DSH_SANDBOX", "auto") == "off":
@@ -418,6 +450,8 @@ class HarnessService:
                 self._check_session_preset(session, agent_preset)
             handle = self._attach(session)
         self._ensure_schedule_runtime()
+        if self.hooks is not None and self.hooks.loaded:
+            self._fire_session_start_hook(handle)
         self._publish_host(
             {
                 "type": "host/session-added",
@@ -528,6 +562,91 @@ class HarnessService:
                 break
         return {"items": matches, "hasMore": False}
 
+    async def _run_user_prompt_hook(
+        self,
+        handle: SessionHandle,
+        content: list[JsonObject],
+    ) -> MergedHookOutcome:
+        assert self.hooks is not None
+        session = handle.session
+        payload = self._hook_base_payload(session, "UserPromptSubmit")
+        payload["prompt"] = blocks_to_text(content)
+        merged = await self.hooks.run_point(
+            "UserPromptSubmit",
+            "",
+            payload,
+            session=None,
+            cwd=session.header.cwd or str(self.cwd),
+        )
+        pending = handle.pending_hook_context
+        if pending:
+            handle.pending_hook_context = []
+            merged = MergedHookOutcome(
+                decision=merged.decision,
+                reason=merged.reason,
+                stop=merged.stop,
+                stop_reason=merged.stop_reason,
+                additional_context=(*pending, *merged.additional_context),
+                system_messages=merged.system_messages,
+            )
+        return merged
+
+    def _fire_session_start_hook(self, handle: SessionHandle) -> None:
+        assert self.hooks is not None
+        session = handle.session
+        payload = self._hook_base_payload(session, "SessionStart")
+        payload["source"] = "start"
+
+        async def run() -> None:
+            assert self.hooks is not None
+            merged = await self.hooks.run_point(
+                "SessionStart",
+                "start",
+                payload,
+                session=None,
+                cwd=session.header.cwd or str(self.cwd),
+            )
+            if merged.additional_context:
+                handle.pending_hook_context.extend(merged.additional_context)
+
+        task = asyncio.create_task(run(), name=f"dsh-hook-session-start-{session.id}")
+        self._hook_tasks.add(task)
+        task.add_done_callback(self._hook_tasks.discard)
+
+    async def _run_stop_hook(self, handle: SessionHandle) -> None:
+        """Fire the Stop hook; a deny forces one bounded continuation turn."""
+
+        assert self.hooks is not None
+        session = handle.session
+        consecutive = 0
+        while consecutive < 3:
+            payload = self._hook_base_payload(session, "Stop")
+            payload["stop_hook_active"] = consecutive > 0
+            merged = await self.hooks.run_point(
+                "Stop",
+                "",
+                payload,
+                session=None,
+                cwd=session.header.cwd or str(self.cwd),
+            )
+            if merged.decision != "deny":
+                return
+            consecutive += 1
+            text = merged.reason or "continue: blocked by Stop hook"
+            await self.prompt(
+                session.id,
+                [{"type": "text", "text": text}],
+                include_message_id=False,
+            )
+
+    def _hook_base_payload(self, session: Session, event: str) -> dict[str, Any]:
+        return {
+            "session_id": session.id,
+            "transcript_path": str(self.store.path_for(session.id)),
+            "cwd": session.header.cwd or str(self.cwd),
+            "hook_event_name": event,
+        }
+
     async def _deliver_schedule_reminder(self, session_id: str, framing: str) -> None:
         await self.prompt(
             session_id,
@@ -557,6 +676,20 @@ class HarnessService:
                 "session-backed subagents must use subagent.prompt",
                 {"reason": "subagent"},
             )
+        if self.hooks is not None and self.hooks.loaded:
+            merged = await self._run_user_prompt_hook(handle, content)
+            if merged.decision in {"deny", "ask"}:
+                raise ApiFault(
+                    "hook-blocked",
+                    merged.reason or "blocked by UserPromptSubmit hook",
+                )
+            if merged.stop:
+                raise ApiFault(
+                    "hook-stopped",
+                    merged.stop_reason or merged.reason or "stopped by UserPromptSubmit hook",
+                )
+            for extra in merged.additional_context:
+                content = [*content, {"type": "text", "text": extra}]
         message = await self._build_message(content, client_time_zone=client_time_zone)
         command_line = self._command_line(message)
         if command_line is not None:
@@ -1990,6 +2123,8 @@ class HarnessService:
         if title_tasks:
             await asyncio.gather(*title_tasks, return_exceptions=True)
         self._session_title_tasks.clear()
+        if self._hook_tasks:
+            await asyncio.gather(*self._hook_tasks, return_exceptions=True)
         await self._schedule_runtime.stop()
         handles = tuple(self._handles.values())
         await self.terminals.close_all()
@@ -2051,6 +2186,8 @@ class HarnessService:
                             "running": False,
                         }
                     )
+            if self.hooks is not None and self.hooks.loaded and not self._disposed:
+                await self._run_stop_hook(handle)
         finally:
             if handle.task is current_task:
                 handle.task = None
@@ -3806,6 +3943,28 @@ class HarnessService:
             owner_session=session.id,
         )
         disposers.extend(shell_disposers)
+        if self.hooks is not None and self.hooks.loaded:
+            bridge = self.hooks
+
+            async def pre_execute(
+                name: str,
+                arguments: dict[str, Any],
+                context: ToolContext,
+            ) -> str | None:
+                return await pre_tool_use_hook(bridge, session, name, arguments, context)
+
+            async def post_execute(
+                name: str,
+                arguments: dict[str, Any],
+                context: ToolContext,
+                result: ToolResult,
+            ) -> ToolResult:
+                return await post_tool_use_hook(
+                    bridge, session, name, arguments, context, result
+                )
+
+            registry.pre_execute = pre_execute
+            registry.post_execute = post_execute
         self._tool_registries[session.id] = registry
 
         def dispose_tool_registry() -> None:
