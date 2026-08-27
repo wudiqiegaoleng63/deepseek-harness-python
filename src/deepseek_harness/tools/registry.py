@@ -32,6 +32,10 @@ ToolExecutor = Callable[[dict[str, Any], ToolContext], ToolResult | Awaitable[To
 ToolResultTransformer = Callable[
     [str, ToolContext, ToolResult], ToolResult | Awaitable[ToolResult]
 ]
+PreExecuteHook = Callable[[str, dict[str, Any], ToolContext], str | None | Awaitable[str | None]]
+PostExecuteHook = Callable[
+    [str, dict[str, Any], ToolContext, ToolResult], ToolResult | Awaitable[ToolResult]
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +63,11 @@ class ToolRegistry:
         self._tools: dict[str, ToolDefinition] = {}
         self._result_transformer = result_transformer
         self._visible_names: set[str] | None = None
+        # Interception seams (mirroring the TS tools/pre-execute and
+        # tools/post-execute extension points).  A pre hook returns a deny
+        # reason to block the call; a post hook may replace the result.
+        self.pre_execute: PreExecuteHook | None = None
+        self.post_execute: PostExecuteHook | None = None
 
     def register(self, definition: ToolDefinition) -> Callable[[], None]:
         if not definition.name or definition.name in self._tools:
@@ -108,6 +117,12 @@ class ToolRegistry:
             return ToolResult(f"invalid JSON arguments for {name}: {exc.msg}", is_error=True)
         if not isinstance(arguments, dict):
             return ToolResult(f"arguments for {name} must be a JSON object", is_error=True)
+        if self.pre_execute is not None:
+            denial = self.pre_execute(name, arguments, context)
+            if inspect.isawaitable(denial):
+                denial = await denial
+            if denial is not None:
+                return ToolResult(denial, is_error=True)
         try:
             result = definition.execute(arguments, context)
             if inspect.isawaitable(result):
@@ -117,6 +132,13 @@ class ToolRegistry:
                     result = await wait_for(result, definition.timeout_seconds)
             if not isinstance(result, ToolResult):
                 raise TypeError("tool executor must return ToolResult")
+            if self.post_execute is not None:
+                replaced = self.post_execute(name, arguments, context, result)
+                if inspect.isawaitable(replaced):
+                    replaced = await replaced
+                if not isinstance(replaced, ToolResult):
+                    raise TypeError("post-execute hook must return ToolResult")
+                result = replaced
             if self._result_transformer is not None:
                 transformed = self._result_transformer(name, context, result)
                 if inspect.isawaitable(transformed):
