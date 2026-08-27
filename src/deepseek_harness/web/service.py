@@ -26,6 +26,7 @@ from ..compaction import CompactionPolicy, ManualCompactionError
 from ..dynamic_cordis import DynamicCordisService, install_dynamic_tools
 from ..errors import HarnessError
 from ..goals import GoalError, GoalManager
+from ..guards import RepeatToolGuard
 from ..hooks import (
     HookBridge,
     HookConfigError,
@@ -56,6 +57,7 @@ from ..plans import has_open_turn
 from ..sandbox import BubblewrapSandbox, SandboxProvider
 from ..schedule import ScheduleManager, ScheduleRuntime, install_schedule_tools
 from ..session import JsonlSessionStore, Session, SessionEvent
+from ..session_query import SessionSearchIndex, documents_from_messages
 from ..session_title import (
     SessionTitleInvalidError,
     SessionTitleService,
@@ -75,6 +77,7 @@ from ..settings import (
 from ..skills import SkillRegistry
 from ..spill import LocalSpillStore, SpillPolicy
 from ..terminal import TerminalSessionService
+from ..time_context import TimeContextInjector
 from ..todos import TodoError, TodoManager
 from ..tool_result_pruner import ToolResultPruner
 from ..tools import (
@@ -223,6 +226,10 @@ class HarnessService:
         hooks_config_path: str | os.PathLike[str] | None = None,
         hooks_project_dir: str | os.PathLike[str] | None = None,
         hooks_plugin_root: str | os.PathLike[str] | None = None,
+        session_query_path: str | os.PathLike[str] | None = None,
+        repeat_guard_thresholds: tuple[int, ...] | None = (3, 5, 8),
+        time_context_zone: str | None = None,
+        time_context_refresh_seconds: float | None = None,
     ) -> None:
         self.store = JsonlSessionStore(session_root)
         state_root = self.store.root
@@ -380,6 +387,28 @@ class HarnessService:
             except HookConfigError:
                 self.hooks = None
         self.schedules = ScheduleManager()
+        self.repeat_guard = (
+            RepeatToolGuard(thresholds=repeat_guard_thresholds)
+            if repeat_guard_thresholds is not None
+            else None
+        )
+        self.time_context = (
+            TimeContextInjector(
+                time_zone=time_context_zone,
+                refresh_interval_seconds=time_context_refresh_seconds or 0.0,
+            )
+            if time_context_zone is not None or time_context_refresh_seconds is not None
+            else None
+        )
+        resolved_query_path = session_query_path or os.getenv("DSH_SESSION_QUERY_PATH")
+        self.session_query: SessionSearchIndex | None = None
+        if resolved_query_path:
+            query_path = (
+                state_root / "session-query"
+                if resolved_query_path == "auto"
+                else Path(resolved_query_path)
+            )
+            self.session_query = SessionSearchIndex(query_path)
         self._schedule_runtime = ScheduleRuntime(
             self.schedules,
             sessions=lambda: [
@@ -551,9 +580,14 @@ class HarnessService:
         needle = query.casefold().strip()
         if not needle:
             return {"items": [], "hasMore": False}
+        if self.session_query is not None and self.session_query.available:
+            if self.session_query.session_count() > 0:
+                return {"items": self.session_query.search(query), "hasMore": False}
         matches: list[JsonObject] = []
         for summary in await self.list_sessions():
             handle = await self.get_session(str(summary["sessionId"]))
+            if self.session_query is not None and self.session_query.available:
+                self._index_session(handle.session)
             for message in handle.session.derive_messages():
                 if needle in message.text.casefold():
                     matches.append({"sessionId": handle.session.id, "snippet": message.text[:240]})
@@ -561,6 +595,14 @@ class HarnessService:
             if len(matches) >= 20:
                 break
         return {"items": matches, "hasMore": False}
+
+    def _index_session(self, session: Session) -> None:
+        if self.session_query is None or not self.session_query.available:
+            return
+        documents = documents_from_messages(
+            [(message.role, message.text) for message in session.derive_messages()]
+        )
+        self.session_query.index_session(session.id, documents)
 
     async def _run_user_prompt_hook(
         self,
@@ -676,6 +718,8 @@ class HarnessService:
                 "session-backed subagents must use subagent.prompt",
                 {"reason": "subagent"},
             )
+        if self.repeat_guard is not None:
+            self.repeat_guard.reset(session_id)
         if self.hooks is not None and self.hooks.loaded:
             merged = await self._run_user_prompt_hook(handle, content)
             if merged.decision in {"deny", "ask"}:
@@ -2179,6 +2223,8 @@ class HarnessService:
                     )
                 finally:
                     await self.store.save(handle.session)
+                    if self.session_query is not None:
+                        self._index_session(handle.session)
                     self._publish_host(
                         {
                             "type": "host/session-status",
@@ -3943,7 +3989,8 @@ class HarnessService:
             owner_session=session.id,
         )
         disposers.extend(shell_disposers)
-        if self.hooks is not None and self.hooks.loaded:
+        hooks_active = self.hooks is not None and self.hooks.loaded
+        if hooks_active or self.repeat_guard is not None:
             bridge = self.hooks
 
             async def pre_execute(
@@ -3951,6 +3998,7 @@ class HarnessService:
                 arguments: dict[str, Any],
                 context: ToolContext,
             ) -> str | None:
+                assert bridge is not None
                 return await pre_tool_use_hook(bridge, session, name, arguments, context)
 
             async def post_execute(
@@ -3959,11 +4007,22 @@ class HarnessService:
                 context: ToolContext,
                 result: ToolResult,
             ) -> ToolResult:
-                return await post_tool_use_hook(
-                    bridge, session, name, arguments, context, result
-                )
+                current = result
+                if hooks_active:
+                    assert bridge is not None
+                    current = await post_tool_use_hook(
+                        bridge, session, name, arguments, context, current
+                    )
+                if self.repeat_guard is not None:
+                    reminder = self.repeat_guard.observe(session.id, name, arguments)
+                    if reminder is not None:
+                        current = ToolResult(
+                            f"{reminder}\n\n{current.text}", is_error=current.is_error
+                        )
+                return current
 
-            registry.pre_execute = pre_execute
+            if hooks_active:
+                registry.pre_execute = pre_execute
             registry.post_execute = post_execute
         self._tool_registries[session.id] = registry
 
@@ -4054,12 +4113,34 @@ class HarnessService:
             compaction_policy=self.compaction_policy,
             tool_result_pruner=self.tool_result_pruner,
             checkpoint_policy=SessionCheckpointPolicy(self.store.save),
-            instruction_provider=self.instruction_loader.prepare,
+            instruction_provider=self._instruction_provider,
         )
         handle = SessionHandle(session, agent, disposers, policy, shell_disposers)
         agent.subscribe(lambda event: self._on_agent_event(session, event))
         self._handles[session.id] = handle
         return handle
+
+    async def _instruction_provider(self, session: Session) -> Message | None:
+        """Compose workspace instructions with the optional time context."""
+
+        instruction = await self.instruction_loader.prepare(session)
+        if self.time_context is None:
+            return instruction
+        time_text = self.time_context.message_text(session)
+        if time_text is None:
+            return instruction
+        time_block = TextContent(time_text)
+        if instruction is None:
+            return Message(
+                role="user",
+                content=(time_block,),
+                source=self.time_context.source(),
+            )
+        return Message(
+            role="user",
+            content=(*instruction.content, time_block),
+            source=instruction.source,
+        )
 
     def _default_adapter(self, model: str) -> LlmAdapter:
         config = self.settings.get_value_sync("llm-deepseek")

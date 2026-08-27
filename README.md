@@ -69,6 +69,14 @@ The native Python host now contains:
   command hooks run with the CC payload dialect, matcher semantics, exit-code
   contract, and deny/ask/allow precedence; `hook/invoked` and `hook/result`
   events are recorded in the session log;
+- the repeat-tool-reminder guard: consecutive identical tool calls trigger
+  gentle-then-detailed advisory reminders (thresholds 3/5/8, wildcard
+  include/exclude, user turns reset the chain) without vetoing any call;
+- opt-in time context (`time_context_zone`): eligible model steps gain a
+  durable, plugin-sourced clock reading with refresh throttling;
+- optional SQLite FTS5 session retrieval (`DSH_SESSION_QUERY_PATH=auto` or a
+  path): `session.search` answers from the durable index across cold sessions
+  and falls back to in-memory search whenever the index is unavailable;
 - workspace-write shell and persistent terminals confined through the
   bubblewrap sandbox (read-only root bind, private `/tmp`, read-write
   workspace bind) with fail-closed behavior when `bwrap` is absent;
