@@ -17,11 +17,12 @@ from typing import Any, Literal, cast
 
 import httpx
 
-from ..acp_client import AcpRun, AcpSubagentConfig, start_acp_run
+from ..acp_client import AcpSubagentConfig, start_acp_run
 from ..agent import Agent
 from ..agent_presets import AgentPresetError, AgentPresetRegistry
 from ..attachments import IMAGE_MEDIA_TYPES, AttachmentError, AttachmentStore, ImageAttachment
 from ..checkpoint import SessionCheckpointPolicy
+from ..claude_code_client import ClaudeCodeSubagentConfig, start_claude_run
 from ..code_mode import CodeRuntimeConfig, install_code_tool, render_code_sdk
 from ..compaction import CompactionPolicy, ManualCompactionError
 from ..dynamic_cordis import DynamicCordisService, install_dynamic_tools
@@ -58,7 +59,7 @@ from ..plans import fold as fold_plan_mode
 from ..plans import has_open_turn
 from ..sandbox import BubblewrapSandbox, SandboxProvider
 from ..schedule import ScheduleManager, ScheduleRuntime, install_schedule_tools
-from ..sdk_client import SdkRun, SdkSubagentConfig, start_sdk_run
+from ..sdk_client import SdkSubagentConfig, start_sdk_run
 from ..session import JsonlSessionStore, Session, SessionEvent
 from ..session_query import SessionSearchIndex, documents_from_messages
 from ..session_title import (
@@ -150,6 +151,16 @@ class SessionHandle:
 
 
 @dataclass(slots=True)
+class _RemoteRun:
+    """One live out-of-process child owned by this service."""
+
+    run: Any
+    provider: str
+    label: str
+    parent: str
+
+
+@dataclass(slots=True)
 class QueueItem:
     message: Message
     placement: Literal["queued", "steering", "context"] = "queued"
@@ -236,6 +247,7 @@ class HarnessService:
         mcp_servers: tuple[McpStdioConfig, ...] = (),
         acp_subagent: AcpSubagentConfig | None = None,
         sdk_subagent: SdkSubagentConfig | None = None,
+        claude_code_subagent: ClaudeCodeSubagentConfig | None = None,
     ) -> None:
         self.store = JsonlSessionStore(session_root)
         state_root = self.store.root
@@ -419,11 +431,10 @@ class HarnessService:
         # `list_agents` can report them and disposal can reap every child.
         self.acp_subagent = acp_subagent
         self.sdk_subagent = sdk_subagent
-        self._sdk_runs: dict[str, SdkRun] = {}
-        self._sdk_run_labels: dict[str, str] = {}
-        self._acp_runs: dict[str, AcpRun] = {}
-        self._acp_run_labels: dict[str, str] = {}
-        self._acp_run_parents: dict[str, str] = {}
+        self.claude_code_subagent = claude_code_subagent
+        #: Every live out-of-process child this service started, by run id, so
+        #: `list_agents` reports them and disposal reaps them all.
+        self._remote_runs: dict[str, _RemoteRun] = {}
         self._schedule_runtime = ScheduleRuntime(
             self.schedules,
             sessions=lambda: [
@@ -2239,17 +2250,12 @@ class HarnessService:
             await handle.agent.dispose()
         # Reap every out-of-process ACP child this service started; a run whose
         # delegating turn was cancelled still owns a live process.
-        sdk_runs = tuple(self._sdk_runs.values())
-        if sdk_runs:
-            await asyncio.gather(*(run.dispose() for run in sdk_runs), return_exceptions=True)
-            self._sdk_runs.clear()
-            self._sdk_run_labels.clear()
-        acp_runs = tuple(self._acp_runs.values())
-        if acp_runs:
-            await asyncio.gather(*(run.dispose() for run in acp_runs), return_exceptions=True)
-            self._acp_runs.clear()
-            self._acp_run_labels.clear()
-            self._acp_run_parents.clear()
+        remote_runs = tuple(record.run for record in self._remote_runs.values())
+        if remote_runs:
+            await asyncio.gather(
+                *(run.dispose() for run in remote_runs), return_exceptions=True
+            )
+            self._remote_runs.clear()
         self._handles.clear()
         self._tool_registries.clear()
         await self.jobs.close()
@@ -3405,6 +3411,13 @@ class HarnessService:
                     )
                 if self.sdk_subagent is not None and agent == self.sdk_subagent.provider_name:
                     return await self._run_sdk_subagent(parent, label, prompt, inherit_context)
+                if (
+                    self.claude_code_subagent is not None
+                    and agent == self.claude_code_subagent.provider_name
+                ):
+                    return await self._run_claude_code_subagent(
+                        parent, label, prompt, inherit_context
+                    )
                 return await self._run_acp_subagent(parent, label, prompt, agent, inherit_context)
             # The in-process provider defaults to background.
             run_in_background = True if background_argument is None else background_argument
@@ -3487,9 +3500,11 @@ class HarnessService:
                             f"{entry['id']} [diagnostic: {entry.get('reason')}]{position}"
                         )
                     else:
+                        provider = entry.get("provider")
                         rendered_rows.append(
-                            f"{entry['id']} [{entry.get('status')}]{position}"
-                            f" — {entry.get('label', entry['id'])}"
+                            f"{entry['id']} [{entry.get('status')}]"
+                            f"{f' {provider}' if isinstance(provider, str) else ''}"
+                            f"{position} — {entry.get('label', entry['id'])}"
                         )
                 rendered = "\n".join(rendered_rows)
             return ToolResult(rendered, meta={"entries": entries, "scope": scope})
@@ -3497,7 +3512,7 @@ class HarnessService:
         disposers: list[Callable[[], None]] = []
         configured_agents = [
             config.provider_name
-            for config in (self.acp_subagent, self.sdk_subagent)
+            for config in (self.acp_subagent, self.sdk_subagent, self.claude_code_subagent)
             if config is not None
         ]
         agent_property = (
@@ -3774,16 +3789,12 @@ class HarnessService:
             }
         )
         run = await start_acp_run([{"type": "text", "text": prompt}], spec=spec)
-        self._acp_runs[run.id] = run
-        self._acp_run_labels[run.id] = label
-        self._acp_run_parents[run.id] = parent.session.id
+        self._remote_runs[run.id] = _RemoteRun(run, provider, label, parent.session.id)
         try:
             result = await run.result()
         finally:
             await run.dispose()
-            self._acp_runs.pop(run.id, None)
-            self._acp_run_labels.pop(run.id, None)
-            self._acp_run_parents.pop(run.id, None)
+            self._remote_runs.pop(run.id, None)
         return self._remote_subagent_result(run.id, provider, result.output, result.stop_reason)
 
     async def _run_sdk_subagent(
@@ -3817,14 +3828,50 @@ class HarnessService:
             }
         )
         run = await start_sdk_run(prompt, spec=spec)
-        self._sdk_runs[run.id] = run
-        self._sdk_run_labels[run.id] = label
+        self._remote_runs[run.id] = _RemoteRun(run, provider, label, parent.session.id)
         try:
             result = await run.result()
         finally:
             await run.dispose()
-            self._sdk_runs.pop(run.id, None)
-            self._sdk_run_labels.pop(run.id, None)
+            self._remote_runs.pop(run.id, None)
+        return self._remote_subagent_result(run.id, provider, result.output, result.stop_reason)
+
+    async def _run_claude_code_subagent(
+        self,
+        parent: SessionHandle,
+        label: str,
+        prompt: str,
+        inherit_context: bool,
+    ) -> ToolResult:
+        """Delegate one task to the native Claude Code CLI."""
+
+        config = self.claude_code_subagent
+        if config is None:
+            raise ValueError(
+                "this session has no claude-code agent configured; delegate in-process instead"
+            )
+        provider = config.provider_name
+        if inherit_context:
+            raise ValueError(
+                f"subagent provider {provider!r} inherits no parent context; "
+                "use subagent_fork for a seeded child"
+            )
+        spec = config.spec_for(parent.session.header.cwd)
+        self._publish_host(
+            {
+                "type": "host/subagent-started",
+                "sessionId": parent.session.id,
+                "provider": provider,
+                "label": label,
+            }
+        )
+        run = await start_claude_run(prompt, spec=spec)
+        self._remote_runs[run.id] = _RemoteRun(run, provider, label, parent.session.id)
+        try:
+            result = await run.result()
+        finally:
+            await run.dispose()
+            self._remote_runs.pop(run.id, None)
         return self._remote_subagent_result(run.id, provider, result.output, result.stop_reason)
 
     async def _run_foreground_subagent(
@@ -4062,34 +4109,21 @@ class HarnessService:
                     entries.append(entry)
                 if scope == "descendants":
                     pending.append((child.id, child_depth))
-        # Out-of-process children own no session in this harness, so the SDK
-        # and ACP providers report their live runs from their own registries.
-        for run_id in tuple(self._sdk_runs):
-            entry = {
-                "kind": "child",
-                "id": run_id,
-                "label": self._sdk_run_labels.get(run_id, run_id),
-                "status": "running",
-                "mode": "one-shot",
-                "provider": self.sdk_subagent.provider_name if self.sdk_subagent else "dsh-sdk",
-            }
-            if scope == "descendants":
-                entry["parent"] = parent_session
-                entry["depth"] = 1
-            entries.append(entry)
-        for run_id, run_parent in tuple(self._acp_run_parents.items()):
-            if run_parent != parent_session:
+        # Out-of-process children own no session in this harness, so they are
+        # reported from the live-run registry instead of the session tree.
+        for run_id, record in tuple(self._remote_runs.items()):
+            if record.parent != parent_session:
                 continue
             entry = {
                 "kind": "child",
                 "id": run_id,
-                "label": self._acp_run_labels.get(run_id, run_id),
-                "status": "running" if run_id in self._acp_runs else "ready",
+                "label": record.label,
+                "status": "running",
                 "mode": "one-shot",
-                "provider": self.acp_subagent.provider_name if self.acp_subagent else "acp",
+                "provider": record.provider,
             }
             if scope == "descendants":
-                entry["parent"] = run_parent
+                entry["parent"] = record.parent
                 entry["depth"] = 1
             entries.append(entry)
         return entries

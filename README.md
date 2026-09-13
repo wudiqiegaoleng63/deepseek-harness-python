@@ -97,12 +97,13 @@ The native Python host now contains:
   cross-language and multi-process embedding;
 - an automation-only ACP server over stdio with fresh text sessions,
   committed assistant updates, one-shot permission decisions, and cancellation;
-- two out-of-process subagent providers beside the in-process one: an ACP
-  client bridge that drives any Agent Client Protocol agent, and an SDK bridge
-  that drives a peer harness runtime over stdio JSON-RPC. Both spawn from a
-  credential-scrubbed environment, collect the child's answer, expose a
-  machine permission policy where the wire has one, and tear down through an
-  EOF → SIGTERM → SIGKILL ladder.
+- out-of-process subagent providers beside the in-process one: an ACP client
+  bridge that drives any Agent Client Protocol agent, an SDK bridge that drives
+  a peer harness runtime over stdio JSON-RPC, and a Claude Code bridge that
+  drives the native `claude` CLI. Each spawns from a credential-scrubbed
+  environment, returns only a completed answer (a failed or partial child is an
+  errored result), exposes a machine permission policy where the wire has one,
+  and tears down through an EOF → SIGTERM → SIGKILL ladder.
 
 Install the development project with `uv`:
 
@@ -229,9 +230,14 @@ Image, audio, embedded-resource, MCP, and additional-directory features are
 intentionally rejected or disabled.
 
 The same protocol can be driven in the other direction: `HarnessService`
-accepts an `AcpSubagentConfig` naming an external ACP agent, or an
-`SdkSubagentConfig` naming a peer harness runtime (`dsh-python sdk-server`),
-and each becomes a `subagent` tool provider (`agent="acp"` / `agent="dsh-sdk"`). Such a child is a fresh remote
+accepts an `AcpSubagentConfig` naming an external ACP agent, an
+`SdkSubagentConfig` naming a peer harness runtime (`dsh-python sdk-server`), or
+a `ClaudeCodeSubagentConfig` naming the native Claude Code CLI, and each
+becomes a `subagent` tool provider (`agent="acp"` / `"dsh-sdk"` /
+`"claude-code"`). The Claude Code child runs
+`claude --print --output-format stream-json` with no session persistence and
+`AskUserQuestion` disallowed, and only a strict success result with non-blank
+text counts as its answer. Such a child is a fresh remote
 session, so it runs foreground-only: it inherits no conversation context,
 cannot be messaged afterwards, and is always reaped when the delegation ends
 or the service is disposed. Up to that boundary the provider behaves like the

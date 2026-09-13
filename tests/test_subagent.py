@@ -379,3 +379,125 @@ def test_both_remote_providers_are_offered_by_name(tmp_path) -> None:
         await service.dispose()
 
     asyncio.run(scenario())
+
+
+def claude_service(tmp_path, extra_env=None):
+    """A harness whose `subagent` tool can delegate to the fixture Claude CLI."""
+
+    import os
+    import sys
+    from pathlib import Path
+
+    from deepseek_harness.claude_code_client import ClaudeCodeSubagentConfig
+
+    env = {name: value for name, value in os.environ.items() if name.startswith("MOCK_")}
+    env.update(extra_env or {})
+    return HarnessService(
+        tmp_path / "sessions",
+        cwd=tmp_path,
+        adapter_factory=lambda _model: cast(LlmAdapter, RepeatingAdapter()),
+        claude_code_subagent=ClaudeCodeSubagentConfig(
+            command=sys.executable,
+            args=(str(Path(__file__).parent / "claude_child_fixture.py"),),
+            env=env,
+            dispose_eof_grace_ms=2_000,
+        ),
+    )
+
+
+def test_claude_code_subagent_delegates_the_task_and_returns_the_answer(tmp_path) -> None:
+    async def scenario() -> None:
+        service = claude_service(tmp_path, {"MOCK_CLAUDE_RESULT": "claude finished it"})
+        await service.dispatch("session.create", {"sessionId": "parent", "cwd": str(tmp_path)})
+        registry = service._tool_registries["parent"]
+        result = await registry.execute(
+            "subagent",
+            json.dumps(
+                {
+                    "description": "hand off to claude",
+                    "prompt": "Do the whole task.",
+                    "agent": "claude-code",
+                }
+            ),
+            ToolContext("parent", str(tmp_path)),
+        )
+        assert not result.is_error
+        assert "claude finished it" in result.text
+        assert result.meta is not None
+        assert result.meta["provider"] == "claude-code"
+        assert result.meta["finishReason"] == "completed"
+        await service.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_claude_code_subagent_fails_a_non_success_result(tmp_path) -> None:
+    async def scenario() -> None:
+        service = claude_service(
+            tmp_path,
+            {"MOCK_CLAUDE_SUBTYPE": "error_max_turns", "MOCK_CLAUDE_ERRORS": "turn cap"},
+        )
+        await service.dispatch("session.create", {"sessionId": "parent", "cwd": str(tmp_path)})
+        registry = service._tool_registries["parent"]
+        result = await registry.execute(
+            "subagent",
+            json.dumps({"description": "x", "prompt": "y", "agent": "claude-code"}),
+            ToolContext("parent", str(tmp_path)),
+        )
+        assert result.is_error
+        assert result.meta is not None
+        assert result.meta["finishReason"] == "error"
+        await service.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_claude_code_subagent_is_listed_while_running(tmp_path) -> None:
+    async def scenario() -> None:
+        import os
+        import sys
+        from pathlib import Path
+
+        from deepseek_harness.claude_code_client import ClaudeCodeSubagentConfig
+
+        ready = tmp_path / "ready"
+        env = {name: value for name, value in os.environ.items() if name.startswith("MOCK_")}
+        env.update({"MOCK_CLAUDE_HANG": "1", "MOCK_CLAUDE_READY_FILE": str(ready)})
+        service = HarnessService(
+            tmp_path / "sessions",
+            cwd=tmp_path,
+            adapter_factory=lambda _model: cast(LlmAdapter, RepeatingAdapter()),
+            claude_code_subagent=ClaudeCodeSubagentConfig(
+                command=sys.executable,
+                args=(str(Path(__file__).parent / "claude_child_fixture.py"),),
+                env=env,
+                dispose_eof_grace_ms=200,
+            ),
+        )
+        await service.dispatch("session.create", {"sessionId": "parent", "cwd": str(tmp_path)})
+        registry = service._tool_registries["parent"]
+        context = ToolContext("parent", str(tmp_path))
+        pending = asyncio.ensure_future(
+            registry.execute(
+                "subagent",
+                json.dumps({"description": "long job", "prompt": "Work.", "agent": "claude-code"}),
+                context,
+            )
+        )
+        for _ in range(500):
+            if ready.exists():
+                break
+            await asyncio.sleep(0.02)
+        else:
+            raise AssertionError("the delegated child never started")
+
+        listed = await registry.execute("list_agents", "{}", context)
+        assert not listed.is_error
+        assert "long job" in listed.text
+        assert "claude-code" in listed.text
+
+        await service.dispose()
+        result = await pending
+        assert result.is_error
+
+    asyncio.run(scenario())
