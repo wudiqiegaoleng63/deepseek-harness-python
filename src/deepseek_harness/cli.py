@@ -123,6 +123,51 @@ def sdk_server(
         raise typer.Exit(code=130) from exc
 
 
+@app.command("acp-server")
+def acp_server(
+    cwd: Path = typer.Option(Path.cwd(), "--cwd", help="Default workspace directory."),
+    model: str = typer.Option("deepseek-v4-flash", "--model", help="DeepSeek model id."),
+    session_root: Path | None = typer.Option(
+        None, "--session-root", help="JSONL session directory."
+    ),
+    base_url: str | None = typer.Option(
+        None,
+        "--base-url",
+        envvar="DEEPSEEK_BASE_URL",
+        help="DeepSeek-compatible API base URL.",
+    ),
+    api_key: str | None = typer.Option(
+        None,
+        "--api-key",
+        envvar="DEEPSEEK_API_KEY",
+        help="API key; defaults to DEEPSEEK_API_KEY.",
+    ),
+    request_timeout_seconds: float = typer.Option(
+        120.0,
+        "--request-timeout",
+        min=1.0,
+        help="Provider request timeout in seconds.",
+    ),
+) -> None:
+    """Serve the automation-only Agent Client Protocol runtime on stdio."""
+
+    from .acp import run_acp_server
+
+    try:
+        asyncio.run(
+            run_acp_server(
+                cwd=str(cwd),
+                model=model,
+                session_root=str(session_root) if session_root else None,
+                api_key=api_key,
+                base_url=base_url,
+                timeout=request_timeout_seconds,
+            )
+        )
+    except KeyboardInterrupt as exc:
+        raise typer.Exit(code=130) from exc
+
+
 @app.command("serve")
 def serve(
     host: str = typer.Option("127.0.0.1", "--host", help="Bind address."),

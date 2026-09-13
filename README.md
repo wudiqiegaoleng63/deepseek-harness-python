@@ -94,7 +94,9 @@ The native Python host now contains:
 - the original React/TypeScript frontend served with the Python host;
 - a native synchronous `DeepSeekHarness` SDK for embedding the runtime;
 - a stdio JSON-RPC SDK server and `DeepSeekHarnessProcess` client for
-  cross-language and multi-process embedding.
+  cross-language and multi-process embedding;
+- an automation-only ACP server over stdio with fresh text sessions,
+  committed assistant updates, one-shot permission decisions, and cancellation.
 
 Install the development project with `uv`:
 
@@ -202,6 +204,23 @@ uv run dsh-python sdk-server
 It reads and writes one JSON-RPC object per line on stdin/stdout. Configure
 the provider with `--api-key`, `--base-url`, and `--request-timeout`, or use
 the matching `DEEPSEEK_API_KEY` and `DEEPSEEK_BASE_URL` environment variables.
+
+For ACP-compatible automation clients, launch the text-only session bridge:
+
+```sh
+uv run dsh-python acp-server --cwd /path/to/workspace
+```
+
+The ACP bridge supports `initialize`, `authenticate`, `session/new`,
+`session/prompt`, and `session/cancel`; `session/update` notifications carry
+only committed assistant text chunks. Normal quiescence reports `end_turn`,
+while explicit cancellation, disposal, or a prompt whose admission was
+discarded reports `cancelled`. Approval requests raised for a bridge-owned
+session that carry a tool call id become one-shot
+`session/request_permission` requests with `allow-once` and `reject-once`
+choices; any other answer, or an unanswered request, never grants access.
+Image, audio, embedded-resource, MCP, and additional-directory features are
+intentionally rejected or disabled.
 
 Shell execution is disabled in `read-only` sessions. In `workspace-write`
 sessions, shell and persistent terminal tools are registered when the

@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import itertools
 import json
 import os
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from .llm import DeepSeekAdapter
 from .web.service import HarnessService
@@ -25,7 +26,18 @@ SDK_SERVER_VERSION = "0.1.0.dev0"
 
 JsonObject = dict[str, Any]
 NotificationSink = Callable[[str, JsonObject], Awaitable[None]]
+RequestSink = Callable[[str, JsonObject], Awaitable[Any]]
 ServiceFactory = Callable[[JsonObject], HarnessService | Awaitable[HarnessService]]
+
+
+class StdioJsonRpcServer(Protocol):
+    def set_notification_sink(self, notify: NotificationSink | None) -> None: ...
+
+    def set_request_sink(self, request: RequestSink | None) -> None: ...
+
+    async def handle_request(self, method: str, params: Any = None) -> JsonObject: ...
+
+    async def close(self) -> None: ...
 
 
 class JsonRpcResponseError(Exception):
@@ -65,6 +77,7 @@ class HarnessSdkJsonRpcServer:
     ) -> None:
         self._service_factory = service_factory
         self._notify_sink = notify
+        self._request_sink: RequestSink | None = None
         self._max_tokens_as_success = max_tokens_as_success
         self._service: HarnessService | None = None
         self._cwd = ""
@@ -83,6 +96,16 @@ class HarnessSdkJsonRpcServer:
         if self._service is not None:
             raise RuntimeError("notification sink cannot change after initialize")
         self._notify_sink = notify
+
+    def set_request_sink(self, request: RequestSink | None) -> None:
+        """Accept the transport's outbound-request sink.
+
+        The SDK protocol is client-driven and issues no server-to-client
+        requests, so the sink is retained only to satisfy the shared transport
+        contract.
+        """
+
+        self._request_sink = request
 
     async def handle_request(self, method: str, params: Any = None) -> JsonObject:
         """Dispatch one protocol request and return its JSON object result."""
@@ -262,17 +285,21 @@ class HarnessSdkJsonRpcServer:
 
 
 async def serve_stdio(
-    server: HarnessSdkJsonRpcServer,
+    server: StdioJsonRpcServer,
     *,
     input_stream: Any = None,
     output_stream: Any = None,
 ) -> None:
-    """Run a JSON-RPC server over line-buffered binary stdio streams."""
+    """Run a JSON-RPC server over line-buffered binary stdio streams.
+
+    Requests are dispatched concurrently so a long-running prompt does not
+    block a cancellation notification or an independent request from being
+    read from the same connection.
+    """
 
     source = input_stream or sys.stdin.buffer
     target = output_stream or sys.stdout.buffer
     write_lock = asyncio.Lock()
-    shutdown_requested = False
 
     async def write(frame: JsonObject) -> None:
         payload = (json.dumps(frame, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
@@ -284,10 +311,75 @@ async def serve_stdio(
         await write({"jsonrpc": "2.0", "method": method, "params": params})
 
     server.set_notification_sink(notify)
+
+    pending_requests: dict[str, asyncio.Future[Any]] = {}
+    request_ids = itertools.count(1)
+
+    async def request(method: str, params: JsonObject) -> Any:
+        request_id = f"srv-{next(request_ids)}"
+        future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        pending_requests[request_id] = future
+        await write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        try:
+            return await future
+        finally:
+            pending_requests.pop(request_id, None)
+
+    server.set_request_sink(request)
+
+    def route_response(message: JsonObject) -> None:
+        future = pending_requests.get(str(message.get("id")))
+        if future is None or future.done():
+            return
+        error = message.get("error")
+        if isinstance(error, dict):
+            code = error.get("code")
+            future.set_exception(
+                JsonRpcResponseError(
+                    code if isinstance(code, int) else -32603,
+                    str(error.get("message", "")),
+                    error.get("data"),
+                )
+            )
+        else:
+            future.set_result(message.get("result"))
+
+    async def dispatch(message: JsonObject) -> None:
+        method = message["method"]
+        request_id = message.get("id")
+        params = message.get("params")
+        try:
+            result = await server.handle_request(method, params)
+        except JsonRpcResponseError as exc:
+            if request_id is not None:
+                await write(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {"code": exc.code, "message": str(exc), "data": exc.data},
+                    }
+                )
+        except Exception as exc:
+            if request_id is not None:
+                await write(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {"code": -32603, "message": str(exc)},
+                    }
+                )
+        else:
+            if request_id is not None:
+                await write({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+    request_tasks: set[asyncio.Task[None]] = set()
+    reached_eof = False
+    server_closed = False
     try:
-        while not shutdown_requested:
+        while True:
             raw = await asyncio.to_thread(source.readline)
             if not raw:
+                reached_eof = True
                 break
             try:
                 message = json.loads(raw)
@@ -297,35 +389,38 @@ async def serve_stdio(
                 continue
             method = message.get("method")
             if not isinstance(method, str):
+                # A response to a server-to-client request carries no method.
+                if "id" in message:
+                    route_response(message)
                 continue
-            request_id = message.get("id")
-            params = message.get("params")
-            try:
-                result = await server.handle_request(method, params)
-            except JsonRpcResponseError as exc:
-                if request_id is not None:
-                    await write(
-                        {
-                            "jsonrpc": "2.0",
-                            "id": request_id,
-                            "error": {"code": exc.code, "message": str(exc), "data": exc.data},
-                        }
-                    )
-            except Exception as exc:
-                if request_id is not None:
-                    await write(
-                        {
-                            "jsonrpc": "2.0",
-                            "id": request_id,
-                            "error": {"code": -32603, "message": str(exc)},
-                        }
-                    )
-            else:
-                if request_id is not None:
-                    await write({"jsonrpc": "2.0", "id": request_id, "result": result})
-            shutdown_requested = method == "shutdown"
+            task = asyncio.create_task(
+                dispatch({**message, "method": method}), name=f"dsh-rpc-{method}"
+            )
+            request_tasks.add(task)
+            task.add_done_callback(request_tasks.discard)
+            if method == "shutdown":
+                break
+        if reached_eof and request_tasks:
+            # A disconnected peer cannot send session/cancel. Give quick
+            # requests a chance to finish, then close the server to cancel any
+            # long-running prompt before waiting for its dispatch task.
+            _, pending = await asyncio.wait(tuple(request_tasks), timeout=0.1)
+            if pending:
+                await server.close()
+                server_closed = True
+        while request_tasks:
+            await asyncio.gather(*tuple(request_tasks), return_exceptions=True)
     finally:
-        await server.close()
+        if not server_closed:
+            await server.close()
+        # A closed connection can never answer an outstanding server request;
+        # fail them so an awaiting tool call fails closed instead of hanging.
+        for future in tuple(pending_requests.values()):
+            if not future.done():
+                future.set_exception(
+                    JsonRpcResponseError(-32603, "connection closed before responding")
+                )
+        pending_requests.clear()
 
 
 async def default_sdk_service(
@@ -342,8 +437,7 @@ async def default_sdk_service(
         return DeepSeekAdapter(api_key=api_key, base_url=base_url, timeout=timeout)
 
     return HarnessService(
-        session_root
-        or os.getenv("DSH_SESSION_ROOT", "~/.deepseek_harness_python/sessions"),
+        session_root or os.getenv("DSH_SESSION_ROOT", "~/.deepseek_harness_python/sessions"),
         cwd=Path(str(params["cwd"])),
         model=str(params["model"]),
         adapter_factory=adapter_factory,
@@ -377,6 +471,7 @@ __all__ = [
     "SDK_SERVER_NAME",
     "SDK_SERVER_VERSION",
     "SdkProtocolError",
+    "StdioJsonRpcServer",
     "default_sdk_service",
     "run_sdk_server",
     "serve_stdio",

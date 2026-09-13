@@ -1005,6 +1005,25 @@ class HarnessService:
             if rpc_id in self._pending_approvals:
                 await self._finish_approval(rpc_id, "cancelled")
 
+    async def resolve_approval(
+        self,
+        session_id: str,
+        approval_id: str,
+        outcome: ApprovalOutcome,
+    ) -> bool:
+        """Resolve a pending approval by its public id instead of its rpc id.
+
+        Answerers that are not the browser client (an ACP connection, an
+        in-process policy) never see the transport rpc id, so they address the
+        approval by the session and approval id carried on the mux frame.
+        """
+
+        for rpc_id, pending in tuple(self._pending_approvals.items()):
+            if pending.session_id == session_id and pending.approval_id == approval_id:
+                await self._finish_approval(rpc_id, outcome)
+                return True
+        return False
+
     async def request_question(
         self,
         session_id: str,

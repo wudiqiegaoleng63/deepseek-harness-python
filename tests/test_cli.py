@@ -5,7 +5,7 @@ import json
 from collections.abc import AsyncIterator
 from typing import cast
 
-from deepseek_harness.cli import _run_headless
+from deepseek_harness.cli import _run_headless, app
 from deepseek_harness.llm.adapter import LlmAdapter
 from deepseek_harness.llm.types import LlmRequest, StreamChunk
 from deepseek_harness.tools import PermissionMode
@@ -61,3 +61,7 @@ def test_headless_uses_the_full_service_tool_runtime(tmp_path) -> None:
         )
 
     asyncio.run(scenario())
+
+
+def test_cli_exposes_acp_server_entry_point() -> None:
+    assert any(command.name == "acp-server" for command in app.registered_commands)
