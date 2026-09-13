@@ -50,6 +50,10 @@ The native Python host now contains:
   durable workflow lifecycle events;
 - event-sourced plan mode with `/plan`, the `plan` projection, dynamic plan
   guidance, and `exit_plan_mode` user review;
+- the human `/goal` command (show, create, edit, pause, resume, clear) with the
+  TS grammar and rendering, plus `/feedback`, which records one log-only
+  `feedback/record` event and acknowledges the session and the harness home's
+  anonymous user id;
 - event-sourced permission presets with the shared `permissions` projection,
   `/permission` and `permission.set`, replayable sandbox/approval knobs, and
   live shell registration only for `danger-full-access`;

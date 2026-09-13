@@ -38,6 +38,7 @@ from ..hooks import (
     post_tool_use_hook,
     pre_tool_use_hook,
 )
+from ..identity import get_or_create_anonymous_user_id, resolve_dsh_home
 from ..instructions import WorkspaceInstructionLoader
 from ..jobs import JobHandle, JobOutcome, JobRegistry
 from ..llm import DeepSeekAdapter, LlmCallConfig, RetryPolicy
@@ -119,6 +120,10 @@ from ..workspace import (
 )
 
 JsonObject = dict[str, Any]
+
+GOAL_USAGE = "Usage: /goal [<objective>|clear|edit <objective>|pause|resume]"
+FEEDBACK_USAGE = "Usage: /feedback <text>"
+RAW_EDIT_PATTERN = re.compile(r"^edit(?=\s)", re.IGNORECASE | re.UNICODE)
 Frame = JsonObject
 AdapterFactory = Callable[[str], LlmAdapter]
 
@@ -269,6 +274,9 @@ class HarnessService:
         if configured_tools_mode not in {"native", "code", "both"}:
             raise ValueError("tools_mode must be native, code, or both")
         self.tools_mode = cast(Literal["native", "code", "both"], configured_tools_mode)
+        # The deployment's harness home; identity and instruction discovery
+        # both resolve against it rather than re-reading the environment.
+        self.dsh_home = resolve_dsh_home(dsh_home)
         self.instruction_loader = WorkspaceInstructionLoader(
             dsh_home=dsh_home,
             max_bytes=agent_instructions_max_bytes,
@@ -921,18 +929,200 @@ class HarnessService:
             command["sourceEventSeq"] = source_event_seq
         return {"accepted": True, "command": command}
 
+    async def _execute_goal_command(self, handle: SessionHandle, args: str) -> JsonObject:
+        """Execute the human-facing ``/goal`` command.
+
+        Control words count only when they are the whole input; anything else
+        non-empty is an objective, so ``/goal pause after review`` sets that
+        literal objective.  Domain rejections become one direct command error
+        without exposing goal ids or revisions.
+        """
+
+        session = handle.session
+        command_id = f"cmd-{uuid.uuid4().hex}"
+        run = session.append(
+            "command/run",
+            {
+                "commandId": command_id,
+                "name": "goal",
+                "args": args,
+                "source": {"kind": "user"},
+            },
+        )
+        self._publish_event(session.id, run)
+
+        try:
+            kind, text = self._run_goal_command(handle, args)
+        except GoalError:
+            kind = "error"
+            text = (
+                "The goal command is not valid for the current state. "
+                "Run /goal to view available commands."
+            )
+
+        done = session.append("command/done", {"commandId": command_id, "kind": kind, "text": text})
+        self._publish_event(session.id, done)
+        await self.store.save(session)
+        self._publish_goal_projection(handle)
+        return {"accepted": True, "command": {"kind": kind, "text": text}}
+
+    def _run_goal_command(self, handle: SessionHandle, args: str) -> tuple[str, str]:
+        """Apply one parsed ``/goal`` invocation and render its UI outcome.
+
+        Only the grammar owned by ``/goal`` is parsed: control words count when
+        they are the whole input, and every other non-empty suffix is an
+        objective.
+        """
+
+        session = handle.session
+        folded = self.goals.fold(session)
+        current = folded.goal
+        raw = args.strip()
+        control = raw.lower()
+
+        if not raw:
+            if current is None:
+                return "success", f"No goal is currently set.\n{GOAL_USAGE}"
+            return "success", self._render_goal("Goal", handle)
+        if control == "edit":
+            return "error", f"Goal editing requires a replacement objective.\n{GOAL_USAGE}"
+        if control == "clear":
+            if current is None:
+                return "success", "No goal to clear."
+            self.goals.clear(session, self._goal_ref(folded))
+            self._goal_activation[session.id] = "disarmed"
+            return "success", "Goal cleared."
+        if control in {"pause", "resume"}:
+            if current is None:
+                return (
+                    "error",
+                    f"No goal is currently set; /goal {control} requires one. {GOAL_USAGE}",
+                )
+            self.goals.transition(
+                session, cast(Literal["pause", "resume"], control), self._goal_ref(folded)
+            )
+            self._goal_activation[session.id] = "armed" if control == "resume" else "disarmed"
+            return (
+                "success",
+                self._render_goal(
+                    "Goal resumed" if control == "resume" else "Goal paused", handle
+                ),
+            )
+        editing = RAW_EDIT_PATTERN.match(raw) is not None
+        objective = raw[4:].strip() if editing else raw
+        if editing and not objective:
+            return "error", f"Goal editing requires a replacement objective.\n{GOAL_USAGE}"
+        if editing and current is not None and current.phase != "complete":
+            self.goals.edit(session, self._goal_ref(folded), objective, None)
+            return "success", self._render_goal("Goal updated", handle)
+        if current is not None and current.phase != "complete":
+            # An unfinished goal is never replaced without an explicit clear.
+            return (
+                "error",
+                f"A goal is already {current.phase}. Use /goal edit <objective> to change it "
+                "or /goal clear before replacing it.",
+            )
+        self.goals.create(session, objective, None)
+        self._goal_activation[session.id] = "armed"
+        return "success", self._render_goal("Goal created", handle)
+
+    def _render_goal(self, title: str, handle: SessionHandle) -> str:
+        """Render goal state without exposing compare-and-set internals."""
+
+        folded = self.goals.fold(handle.session)
+        goal = folded.goal
+        assert goal is not None
+        activation = self._goal_activation.get(handle.session.id, "disarmed")
+        lines = [title, f"Status: {goal.phase}"]
+        if goal.phase == "blocked" and goal.blocked_reason is not None:
+            reason = goal.blocked_reason
+            lines.append(f"Blocker: {reason.get('code')}: {reason.get('message')}")
+        lines.extend(
+            [
+                f"Objective: {goal.objective}",
+                f"Rounds: {folded.rounds_started}/{goal.max_goal_rounds}",
+                f"Activation: {activation}",
+                "",
+                f"Commands: {self._goal_command_hint(goal.phase, activation)}",
+            ]
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _goal_command_hint(phase: str, activation: str) -> str:
+        """The commands that are meaningful from this exact live state."""
+
+        if phase == "active":
+            if activation == "armed":
+                return "/goal edit <objective>, /goal pause, /goal clear"
+            return "/goal edit <objective>, /goal resume, /goal clear"
+        if phase in {"paused", "blocked"}:
+            return "/goal edit <objective>, /goal resume, /goal clear"
+        return "/goal <objective>, /goal clear"
+
+    @staticmethod
+    def _goal_ref(folded: Any) -> dict[str, Any]:
+        ref = folded.last_ref
+        if not isinstance(ref, dict):
+            raise GoalError("goal is missing its compare-and-set reference", "missing-ref")
+        return ref
+
+    async def _execute_feedback_command(self, handle: SessionHandle, args: str) -> JsonObject:
+        """Execute the human-facing ``/feedback`` command.
+
+        The text is log-only: it reaches exactly one durable payload
+        (``feedback/record``) and never enters model context.  The command
+        record therefore omits its input, so the same text is not stored twice.
+        """
+
+        session = handle.session
+        command_id = f"cmd-{uuid.uuid4().hex}"
+        run = session.append(
+            "command/run",
+            {
+                "commandId": command_id,
+                "name": "feedback",
+                "source": {"kind": "user"},
+            },
+        )
+        self._publish_event(session.id, run)
+
+        text = args.strip()
+        if not text:
+            kind = "error"
+            rendered = f"Feedback text is required. {FEEDBACK_USAGE}"
+        else:
+            kind = "success"
+            record = session.append("feedback/record", {"text": text})
+            self._publish_event(session.id, record)
+            user_id = get_or_create_anonymous_user_id(self.dsh_home)
+            rendered = (
+                f"Feedback recorded for session {session.id}\n"
+                f"Anonymous user: {user_id}. Session sharing is not configured."
+            )
+        done = session.append(
+            "command/done", {"commandId": command_id, "kind": kind, "text": rendered}
+        )
+        self._publish_event(session.id, done)
+        await self.store.save(session)
+        return {"accepted": True, "command": {"kind": kind, "text": rendered}}
+
     async def _execute_command(self, handle: SessionHandle, line: str) -> JsonObject:
         """Execute the small host command surface needed by the shared UI."""
 
         body = line.lstrip()[1:]
         name, separator, raw_args = body.partition(" ")
-        if name not in {"plan", "permission", "compact"}:
+        if name not in {"plan", "permission", "compact", "goal", "feedback"}:
             raise ApiFault("unknown-command", f"unknown command: /{name}")
         args = raw_args if separator else ""
         if name == "permission":
             return await self._execute_permission_command(handle, args)
         if name == "compact":
             return await self._execute_compact_command(handle, args)
+        if name == "goal":
+            return await self._execute_goal_command(handle, args)
+        if name == "feedback":
+            return await self._execute_feedback_command(handle, args)
         target = args.strip() != "off"
         command_id = f"cmd-{uuid.uuid4().hex}"
         run = handle.session.append(
