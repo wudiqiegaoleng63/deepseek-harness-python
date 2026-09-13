@@ -501,3 +501,122 @@ def test_claude_code_subagent_is_listed_while_running(tmp_path) -> None:
         assert result.is_error
 
     asyncio.run(scenario())
+
+
+def codex_service(tmp_path, extra_env=None):
+    """A harness whose `subagent` tool can delegate to the fixture Codex server."""
+
+    import os
+    import sys
+    from pathlib import Path
+
+    from deepseek_harness.codex_client import CodexSubagentConfig
+
+    env = {name: value for name, value in os.environ.items() if name.startswith("MOCK_")}
+    env.update(extra_env or {})
+    return HarnessService(
+        tmp_path / "sessions",
+        cwd=tmp_path,
+        adapter_factory=lambda _model: cast(LlmAdapter, RepeatingAdapter()),
+        codex_subagent=CodexSubagentConfig(
+            command=sys.executable,
+            args=(str(Path(__file__).parent / "codex_child_fixture.py"),),
+            env=env,
+            dispose_eof_grace_ms=2_000,
+        ),
+    )
+
+
+def test_codex_subagent_delegates_and_returns_the_final_answer(tmp_path) -> None:
+    async def scenario() -> None:
+        service = codex_service(tmp_path, {"MOCK_CODEX_ANSWER": "codex handled it"})
+        await service.dispatch("session.create", {"sessionId": "parent", "cwd": str(tmp_path)})
+        registry = service._tool_registries["parent"]
+        result = await registry.execute(
+            "subagent",
+            json.dumps({"description": "hand off to codex", "prompt": "Do it.", "agent": "codex"}),
+            ToolContext("parent", str(tmp_path)),
+        )
+        assert not result.is_error
+        assert "codex handled it" in result.text
+        assert result.meta is not None
+        assert result.meta["provider"] == "codex"
+        assert result.meta["finishReason"] == "completed"
+        await service.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_codex_subagent_fails_a_turn_without_an_answer(tmp_path) -> None:
+    async def scenario() -> None:
+        service = codex_service(
+            tmp_path, {"MOCK_CODEX_ANSWER": "  ", "MOCK_CODEX_COMMENTARY": "only thinking"}
+        )
+        await service.dispatch("session.create", {"sessionId": "parent", "cwd": str(tmp_path)})
+        registry = service._tool_registries["parent"]
+        result = await registry.execute(
+            "subagent",
+            json.dumps({"description": "x", "prompt": "y", "agent": "codex"}),
+            ToolContext("parent", str(tmp_path)),
+        )
+        assert result.is_error
+        assert result.meta is not None
+        assert result.meta["finishReason"] == "error"
+        await service.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_all_four_remote_providers_are_offered_by_name(tmp_path) -> None:
+    async def scenario() -> None:
+        import os
+        import sys
+        from pathlib import Path
+
+        from deepseek_harness.acp_client import AcpSubagentConfig
+        from deepseek_harness.claude_code_client import ClaudeCodeSubagentConfig
+        from deepseek_harness.codex_client import CodexSubagentConfig
+        from deepseek_harness.sdk_client import SdkSubagentConfig
+
+        fixtures = Path(__file__).parent
+        env = {name: value for name, value in os.environ.items() if name.startswith("MOCK_")}
+        service = HarnessService(
+            tmp_path / "sessions",
+            cwd=tmp_path,
+            adapter_factory=lambda _model: cast(LlmAdapter, RepeatingAdapter()),
+            acp_subagent=AcpSubagentConfig(
+                command=sys.executable,
+                args=(str(fixtures / "acp_child_fixture.py"),),
+                env=env,
+                dispose_eof_grace_ms=2_000,
+            ),
+            sdk_subagent=SdkSubagentConfig(
+                command=sys.executable,
+                args=(str(fixtures / "sdk_child_fixture.py"),),
+                env=env,
+                dispose_eof_grace_ms=2_000,
+            ),
+            claude_code_subagent=ClaudeCodeSubagentConfig(
+                command=sys.executable,
+                args=(str(fixtures / "claude_child_fixture.py"),),
+                env=env,
+                dispose_eof_grace_ms=2_000,
+            ),
+            codex_subagent=CodexSubagentConfig(
+                command=sys.executable,
+                args=(str(fixtures / "codex_child_fixture.py"),),
+                env=env,
+                dispose_eof_grace_ms=2_000,
+            ),
+        )
+        await service.dispatch("session.create", {"sessionId": "parent", "cwd": str(tmp_path)})
+        registry = service._tool_registries["parent"]
+        schema = next(item for item in registry.schemas() if item.name == "subagent")
+        properties = schema.parameters["properties"]
+        assert isinstance(properties, dict)
+        agent_schema = properties["agent"]
+        assert isinstance(agent_schema, dict)
+        assert agent_schema["enum"] == ["acp", "dsh-sdk", "claude-code", "codex"]
+        await service.dispose()
+
+    asyncio.run(scenario())

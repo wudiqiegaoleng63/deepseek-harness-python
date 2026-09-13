@@ -24,6 +24,7 @@ from ..attachments import IMAGE_MEDIA_TYPES, AttachmentError, AttachmentStore, I
 from ..checkpoint import SessionCheckpointPolicy
 from ..claude_code_client import ClaudeCodeSubagentConfig, start_claude_run
 from ..code_mode import CodeRuntimeConfig, install_code_tool, render_code_sdk
+from ..codex_client import CodexSubagentConfig, start_codex_run
 from ..compaction import CompactionPolicy, ManualCompactionError
 from ..dynamic_cordis import DynamicCordisService, install_dynamic_tools
 from ..errors import HarnessError
@@ -248,6 +249,7 @@ class HarnessService:
         acp_subagent: AcpSubagentConfig | None = None,
         sdk_subagent: SdkSubagentConfig | None = None,
         claude_code_subagent: ClaudeCodeSubagentConfig | None = None,
+        codex_subagent: CodexSubagentConfig | None = None,
     ) -> None:
         self.store = JsonlSessionStore(session_root)
         state_root = self.store.root
@@ -432,6 +434,7 @@ class HarnessService:
         self.acp_subagent = acp_subagent
         self.sdk_subagent = sdk_subagent
         self.claude_code_subagent = claude_code_subagent
+        self.codex_subagent = codex_subagent
         #: Every live out-of-process child this service started, by run id, so
         #: `list_agents` reports them and disposal reaps them all.
         self._remote_runs: dict[str, _RemoteRun] = {}
@@ -3418,6 +3421,8 @@ class HarnessService:
                     return await self._run_claude_code_subagent(
                         parent, label, prompt, inherit_context
                     )
+                if self.codex_subagent is not None and agent == self.codex_subagent.provider_name:
+                    return await self._run_codex_subagent(parent, label, prompt, inherit_context)
                 return await self._run_acp_subagent(parent, label, prompt, agent, inherit_context)
             # The in-process provider defaults to background.
             run_in_background = True if background_argument is None else background_argument
@@ -3512,7 +3517,12 @@ class HarnessService:
         disposers: list[Callable[[], None]] = []
         configured_agents = [
             config.provider_name
-            for config in (self.acp_subagent, self.sdk_subagent, self.claude_code_subagent)
+            for config in (
+                self.acp_subagent,
+                self.sdk_subagent,
+                self.claude_code_subagent,
+                self.codex_subagent,
+            )
             if config is not None
         ]
         agent_property = (
@@ -3866,6 +3876,44 @@ class HarnessService:
             }
         )
         run = await start_claude_run(prompt, spec=spec)
+        self._remote_runs[run.id] = _RemoteRun(run, provider, label, parent.session.id)
+        try:
+            result = await run.result()
+        finally:
+            await run.dispose()
+            self._remote_runs.pop(run.id, None)
+        return self._remote_subagent_result(run.id, provider, result.output, result.stop_reason)
+
+    async def _run_codex_subagent(
+        self,
+        parent: SessionHandle,
+        label: str,
+        prompt: str,
+        inherit_context: bool,
+    ) -> ToolResult:
+        """Delegate one task to a Codex app-server child."""
+
+        config = self.codex_subagent
+        if config is None:
+            raise ValueError(
+                "this session has no codex agent configured; delegate in-process instead"
+            )
+        provider = config.provider_name
+        if inherit_context:
+            raise ValueError(
+                f"subagent provider {provider!r} inherits no parent context; "
+                "use subagent_fork for a seeded child"
+            )
+        spec = config.spec_for(parent.session.header.cwd)
+        self._publish_host(
+            {
+                "type": "host/subagent-started",
+                "sessionId": parent.session.id,
+                "provider": provider,
+                "label": label,
+            }
+        )
+        run = await start_codex_run(prompt, spec=spec)
         self._remote_runs[run.id] = _RemoteRun(run, provider, label, parent.session.id)
         try:
             result = await run.result()
