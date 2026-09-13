@@ -8,16 +8,18 @@ from pathlib import Path
 import pytest
 
 from deepseek_harness.acp_client import (
-    DEFAULT_DISPOSE_EOF_GRACE_MS,
     AcpClientError,
     AcpRunSpec,
     AcpStartupCancelled,
     acp_content_text,
     acp_stop_reason,
-    dispose_acp_child,
-    scrubbed_child_env,
     start_acp_run,
     to_acp_prompt,
+)
+from deepseek_harness.child_process import (
+    DEFAULT_DISPOSE_EOF_GRACE_MS,
+    dispose_child_process,
+    scrubbed_child_env,
 )
 
 FIXTURE = Path(__file__).parent / "acp_child_fixture.py"
@@ -411,12 +413,12 @@ def test_dispose_tier_three_sigkill_for_a_term_trapping_child(tmp_path: Path) ->
     asyncio.run(scenario())
 
 
-def test_dispose_acp_child_ignores_a_missing_or_exited_process(tmp_path: Path) -> None:
+def test_dispose_child_process_ignores_a_missing_or_exited_process(tmp_path: Path) -> None:
     async def scenario() -> None:
-        await dispose_acp_child(None)
+        await dispose_child_process(None)
         process = await asyncio.create_subprocess_exec(sys.executable, "-c", "pass")
         await process.wait()
-        await dispose_acp_child(process)
+        await dispose_child_process(process)
 
     asyncio.run(scenario())
 

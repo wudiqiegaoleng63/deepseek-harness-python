@@ -14,28 +14,21 @@ import asyncio
 import contextlib
 import itertools
 import json
-import os
-import re
-import signal
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from .child_process import (
+    DEFAULT_DISPOSE_EOF_GRACE_MS,
+    DEFAULT_DISPOSE_GRACE_MS,
+    child_environment,
+    dispose_child_process,
+)
+
 PROTOCOL_VERSION = 1
 
-#: EOF grace for child flush and nested-process teardown; wider than the signal grace below.
-DEFAULT_DISPOSE_EOF_GRACE_MS = 6_000
-
-#: Default POSIX grace between SIGTERM and SIGKILL on dispose.
-DEFAULT_DISPOSE_GRACE_MS = 3_000
-
-#: Credential-shaped ambient names never reach a child implicitly.
-SENSITIVE_ENV_PATTERN = re.compile(r"KEY|PASSWORD|SECRET|TOKEN", re.IGNORECASE)
-
-#: Ambient names the harness owns; a child gets them only through explicit extras.
-DSH_ENV_PREFIX = "DSH_"
 
 PermissionPolicy = Literal["allow", "reject"]
 SubagentStopReason = Literal["completed", "max-tokens", "refusal", "aborted", "error"]
@@ -90,23 +83,6 @@ def to_acp_prompt(blocks: Sequence[Any]) -> list[dict[str, Any]]:
             if isinstance(text, str):
                 rendered.append({"type": "text", "text": text})
     return rendered
-
-
-def scrubbed_child_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Return the ambient environment minus credentials and harness-owned names.
-
-    A deliberately supplied entry survives because explicit extras are merged
-    after the scrub, so a child's own key or a deployment ``DSH_*`` fact can be
-    forwarded on purpose while ambient ones never leak implicitly.
-    """
-
-    source = os.environ if env is None else env
-    scrubbed = {
-        name: value
-        for name, value in source.items()
-        if not SENSITIVE_ENV_PATTERN.search(name) and not name.upper().startswith(DSH_ENV_PREFIX)
-    }
-    return scrubbed
 
 
 @dataclass(frozen=True, slots=True)
@@ -434,7 +410,9 @@ class AcpRun:
 
     async def _dispose_once(self) -> None:
         self.cancel()
-        await dispose_acp_child(self._process, self._spec.dispose_eof_grace_ms)
+        await dispose_child_process(
+            self._process, self._spec.dispose_eof_grace_ms, self._spec.dispose_grace_ms
+        )
         await self._connection.aclose()
         if self._cancel_task is not None:
             with contextlib.suppress(Exception):
@@ -443,52 +421,6 @@ class AcpRun:
         # keeps the run's result attached to its process lifetime.
         with contextlib.suppress(Exception):
             await self._result_task
-
-
-def _signal_tree(process: asyncio.subprocess.Process, sig: int) -> None:
-    try:
-        os.killpg(os.getpgid(process.pid), sig)
-    except (ProcessLookupError, PermissionError, OSError):
-        with contextlib.suppress(ProcessLookupError, OSError):
-            if sig == signal.SIGKILL:
-                process.kill()
-            else:
-                process.terminate()
-
-
-async def _wait_for_exit(process: asyncio.subprocess.Process, seconds: float) -> bool:
-    try:
-        async with asyncio.timeout(seconds):
-            await process.wait()
-    except TimeoutError:
-        return False
-    return True
-
-
-async def dispose_acp_child(
-    process: asyncio.subprocess.Process | None,
-    eof_grace_ms: float = DEFAULT_DISPOSE_EOF_GRACE_MS,
-) -> None:
-    """Cooperative teardown ladder: stdin EOF, then SIGTERM → grace → SIGKILL.
-
-    Resolves only at whole-process quiescence.  A child that already exited (or
-    a failed spawn with no process) needs no teardown.
-    """
-
-    if process is None or process.returncode is not None:
-        return
-    if process.stdin is not None:
-        with contextlib.suppress(BrokenPipeError, ConnectionResetError, RuntimeError, OSError):
-            process.stdin.close()
-    if await _wait_for_exit(process, eof_grace_ms / 1000):
-        return
-    # terminate() owns the bounded SIGTERM→SIGKILL timer; the final wait is the
-    # process owner's unbounded exit proof, not a second derived grace.
-    _signal_tree(process, signal.SIGTERM)
-    if await _wait_for_exit(process, DEFAULT_DISPOSE_GRACE_MS / 1000):
-        return
-    _signal_tree(process, signal.SIGKILL)
-    await process.wait()
 
 
 async def start_acp_run(
@@ -506,8 +438,7 @@ async def start_acp_run(
 
     if cancel_event is not None and cancel_event.is_set():
         raise AcpStartupCancelled()
-    env = scrubbed_child_env()
-    env.update({str(name): str(value) for name, value in spec.env.items()})
+    env = child_environment(spec.env)
     try:
         process = await asyncio.create_subprocess_exec(
             spec.command,
@@ -550,7 +481,7 @@ async def start_acp_run(
         session_id = startup.result()
     except BaseException:
         await connection.aclose()
-        await dispose_acp_child(process, spec.dispose_eof_grace_ms)
+        await dispose_child_process(process, spec.dispose_eof_grace_ms, spec.dispose_grace_ms)
         if cancelled:
             raise AcpStartupCancelled() from None
         raise
@@ -587,11 +518,8 @@ __all__ = [
     "DEFAULT_DISPOSE_EOF_GRACE_MS",
     "DEFAULT_DISPOSE_GRACE_MS",
     "PROTOCOL_VERSION",
-    "SENSITIVE_ENV_PATTERN",
     "acp_content_text",
     "acp_stop_reason",
-    "dispose_acp_child",
-    "scrubbed_child_env",
     "start_acp_run",
     "to_acp_prompt",
 ]
