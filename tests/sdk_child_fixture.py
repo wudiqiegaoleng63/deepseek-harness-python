@@ -41,6 +41,16 @@ def _touch(path: str | None, value: str = "ready") -> None:
             handle.write(value)
 
 
+def _status(session_id: str, status: str) -> None:
+    _write(
+        {
+            "jsonrpc": "2.0",
+            "method": "session.status",
+            "params": {"sessionId": session_id, "status": status},
+        }
+    )
+
+
 def _event(session_id: str, type_: str, data: dict[str, Any]) -> None:
     _write(
         {
@@ -63,6 +73,7 @@ def _handle_prompt(message: dict[str, Any], params: dict[str, Any]) -> None:
         os._exit(1)
     session_id = str(params.get("sessionId", "session"))
     text = os.environ.get("MOCK_SDK_TEXT", "sdk child answer")
+    _status(session_id, "running")
     _event(session_id, "turn/start", {"turn": 0})
     _event(
         session_id,
@@ -100,7 +111,11 @@ def _handle_prompt(message: dict[str, Any], params: dict[str, Any]) -> None:
         # request nor a cancellation can reach it.
         while True:
             time.sleep(0.05)
-    if os.environ.get("MOCK_SDK_NO_TURN_END") != "1":
+    if os.environ.get("MOCK_SDK_NO_TURN_END") == "1":
+        # The activity ends without a durable turn ending, which the parent
+        # must report as a failure rather than a completed answer.
+        _status(session_id, "idle")
+    else:
         _event(
             session_id,
             "turn/end",

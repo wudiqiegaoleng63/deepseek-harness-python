@@ -197,11 +197,25 @@ class _SdkConnection:
         self._reader: asyncio.Task[None] | None = None
         self._closed = False
         self._events: dict[str, list[dict[str, Any]]] = {}
-        self._status: dict[str, str] = {}
+        self._activity: dict[str, asyncio.Event] = {}
 
     @property
     def events(self) -> dict[str, list[dict[str, Any]]]:
         return self._events
+
+    def activity(self, session_id: str) -> asyncio.Event:
+        """The event that fires when the addressed session's turn ends.
+
+        The SDK prompt response only acknowledges that the turn was accepted.
+        Only the child's durable ``turn/end`` marks the activity complete: the
+        child's host-status frames travel on a separate stream and can be
+        written ahead of the session events for the same turn.
+        """
+
+        return self._activity.setdefault(session_id, asyncio.Event())
+
+    def _end_activity(self, session_id: str) -> None:
+        self._activity.setdefault(session_id, asyncio.Event()).set()
 
     def start(self) -> None:
         self._reader = asyncio.get_running_loop().create_task(self._read_loop())
@@ -272,11 +286,17 @@ class _SdkConnection:
         method = message.get("method")
         if isinstance(method, str):
             params = message.get("params")
-            if method == "session.event" and isinstance(params, dict):
-                session_id = params.get("sessionId")
+            if not isinstance(params, dict):
+                return
+            session_id = params.get("sessionId")
+            if not isinstance(session_id, str):
+                return
+            if method == "session.event":
                 event = params.get("event")
-                if isinstance(session_id, str) and isinstance(event, dict):
+                if isinstance(event, dict):
                     self._events.setdefault(session_id, []).append(event)
+                    if event.get("type") == "turn/end":
+                        self._end_activity(session_id)
             return
         future = self._pending.get(str(message.get("id")))
         if future is None or future.done():
@@ -342,6 +362,12 @@ class SdkRun:
     def returncode(self) -> int | None:
         return self._process.returncode
 
+    @property
+    def settled(self) -> bool:
+        """Whether this run's result has settled."""
+
+        return self._result_task.done()
+
     def _answer(self) -> tuple[str, Any]:
         events = self._connection.events.get(self.session_id, [])
         reason: Any = None
@@ -371,9 +397,21 @@ class SdkRun:
             if prompt not in done:
                 text, _ = self._answer()
                 return SdkRunResult(text, "aborted")
+            # The prompt response only acknowledges the turn; the child's own
+            # turn ending (or idle status) settles this activity.
             prompt.result()
-            # The activity's durable turn ending decides the stop reason; the
-            # prompt response only proves the turn was accepted.
+            activity = asyncio.get_running_loop().create_task(
+                self._connection.activity(self.session_id).wait()
+            )
+            try:
+                done, _ = await asyncio.wait(
+                    {activity, self._settled}, return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                if not activity.done():
+                    activity.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await activity
             text, reason = self._answer()
             if self._cancelled:
                 return SdkRunResult(text, "aborted")

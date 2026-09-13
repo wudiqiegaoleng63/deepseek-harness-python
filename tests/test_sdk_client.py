@@ -139,19 +139,32 @@ def test_run_maps_unclean_turn_endings(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
-def test_run_reports_error_when_the_child_never_ends_its_turn(tmp_path: Path) -> None:
+def test_run_waits_for_the_turn_ending_rather_than_an_idle_status(tmp_path: Path) -> None:
     async def scenario() -> None:
+        ready = tmp_path / "ready"
         run = await start_sdk_run(
             "do the task",
-            spec=spec(tmp_path, {"MOCK_SDK_NO_TURN_END": "1", "MOCK_SDK_TEXT": "partial"}),
+            spec=spec(
+                tmp_path,
+                {
+                    "MOCK_SDK_NO_TURN_END": "1",
+                    "MOCK_SDK_TEXT": "partial",
+                    "MOCK_SDK_READY_FILE": str(ready),
+                },
+                dispose_eof_grace_ms=200,
+            ),
         )
-        try:
-            result = await run.result()
-            # Committed text survives, but an activity without a clean ending
-            # is never reported as success.
-            assert (result.output, result.stop_reason) == ("partial", "error")
-        finally:
-            await run.dispose()
+        await wait_for(lambda: ready.exists() and ready.read_text(encoding="utf-8") == "ready")
+        # The child published its idle status, but an activity is settled by
+        # its durable turn ending, so the run stays pending.
+        await asyncio.sleep(0.2)
+        assert not run.settled
+        run.cancel()
+        result = await asyncio.wait_for(run.result(), 5)
+        # Committed text survives, and settling without a turn ending is never
+        # reported as success.
+        assert (result.output, result.stop_reason) == ("partial", "aborted")
+        await run.dispose()
 
     asyncio.run(scenario())
 
