@@ -17,6 +17,7 @@ from typing import Any, Literal, cast
 
 import httpx
 
+from ..acp_client import AcpRun, AcpSubagentConfig, start_acp_run
 from ..agent import Agent
 from ..agent_presets import AgentPresetError, AgentPresetRegistry
 from ..attachments import IMAGE_MEDIA_TYPES, AttachmentError, AttachmentStore, ImageAttachment
@@ -232,6 +233,7 @@ class HarnessService:
         time_context_zone: str | None = None,
         time_context_refresh_seconds: float | None = None,
         mcp_servers: tuple[McpStdioConfig, ...] = (),
+        acp_subagent: AcpSubagentConfig | None = None,
     ) -> None:
         self.store = JsonlSessionStore(session_root)
         state_root = self.store.root
@@ -411,6 +413,12 @@ class HarnessService:
                 else Path(resolved_query_path)
             )
             self.session_query = SessionSearchIndex(query_path)
+        # Out-of-process ACP subagent provider; its live runs are tracked so
+        # `list_agents` can report them and disposal can reap every child.
+        self.acp_subagent = acp_subagent
+        self._acp_runs: dict[str, AcpRun] = {}
+        self._acp_run_labels: dict[str, str] = {}
+        self._acp_run_parents: dict[str, str] = {}
         self._schedule_runtime = ScheduleRuntime(
             self.schedules,
             sessions=lambda: [
@@ -2224,6 +2232,14 @@ class HarnessService:
             for dispose in reversed(handle.disposers):
                 dispose()
             await handle.agent.dispose()
+        # Reap every out-of-process ACP child this service started; a run whose
+        # delegating turn was cancelled still owns a live process.
+        acp_runs = tuple(self._acp_runs.values())
+        if acp_runs:
+            await asyncio.gather(*(run.dispose() for run in acp_runs), return_exceptions=True)
+            self._acp_runs.clear()
+            self._acp_run_labels.clear()
+            self._acp_run_parents.clear()
         self._handles.clear()
         self._tool_registries.clear()
         await self.jobs.close()
@@ -3362,9 +3378,24 @@ class HarnessService:
             parent = await self._tool_parent(context, session)
             label = self._tool_text_argument(args, "description", maximum=160)
             prompt = self._tool_text_argument(args, "prompt", maximum=200_000)
-            run_in_background = args.get("run_in_background", True)
-            if not isinstance(run_in_background, bool):
+            agent = args.get("agent")
+            if agent is not None and (not isinstance(agent, str) or not agent.strip()):
+                raise ValueError("agent must be a non-empty provider name")
+            background_argument = args.get("run_in_background")
+            if background_argument is not None and not isinstance(background_argument, bool):
                 raise ValueError("run_in_background must be a boolean")
+            if agent is not None:
+                # An out-of-process agent has no addressable follow-up, so it
+                # defaults to foreground and rejects only an explicit
+                # background request.
+                if background_argument is True:
+                    raise ValueError(
+                        f"subagent provider {agent!r} is foreground-only: a fresh remote "
+                        "session cannot be addressed by a follow-up tool"
+                    )
+                return await self._run_acp_subagent(parent, label, prompt, agent, inherit_context)
+            # The in-process provider defaults to background.
+            run_in_background = True if background_argument is None else background_argument
             if run_in_background:
                 child_id, job_id = await self._start_background_subagent(
                     parent,
@@ -3452,21 +3483,49 @@ class HarnessService:
             return ToolResult(rendered, meta={"entries": entries, "scope": scope})
 
         disposers: list[Callable[[], None]] = []
+        agent_property = (
+            {
+                "type": "string",
+                "description": (
+                    "Run this task on the configured out-of-process agent instead of an "
+                    "in-process child; such children are fresh, foreground-only, and "
+                    "cannot be messaged afterwards."
+                ),
+            }
+            if self.acp_subagent is not None
+            else None
+        )
+        subagent_description = (
+            "Delegate a self-contained task to a subagent. It runs in the background by "
+            "default and returns a durable subagent id; set run_in_background to false "
+            "when the result is needed immediately."
+        )
+        fork_description = (
+            "Delegate a task to a subagent seeded with this conversation's completed turns. "
+            "It runs in the background by default and returns a durable subagent id."
+        )
         for tool_name, description, inherit_context in (
-            (
-                "subagent",
-                "Delegate a self-contained task to a subagent. It runs in the background by "
-                "default and returns a durable subagent id; set run_in_background to false "
-                "when the result is needed immediately.",
-                False,
-            ),
-            (
-                "subagent_fork",
-                "Delegate a task to a subagent seeded with this conversation's completed turns. "
-                "It runs in the background by default and returns a durable subagent id.",
-                True,
-            ),
+            ("subagent", subagent_description, False),
+            ("subagent_fork", fork_description, True),
         ):
+            properties: dict[str, Any] = {
+                "description": {
+                    "type": "string",
+                    "description": "A short description of the delegated task.",
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "The complete task for the subagent.",
+                },
+                "run_in_background": {
+                    "type": "boolean",
+                    "description": (
+                        "Whether to return immediately with a durable subagent id."
+                    ),
+                },
+            }
+            if agent_property is not None:
+                properties["agent"] = agent_property
             disposers.append(
                 registry.register(
                     ToolDefinition(
@@ -3474,22 +3533,7 @@ class HarnessService:
                         description=description,
                         parameters={
                             "type": "object",
-                            "properties": {
-                                "description": {
-                                    "type": "string",
-                                    "description": "A short description of the delegated task.",
-                                },
-                                "prompt": {
-                                    "type": "string",
-                                    "description": "The complete task for the subagent.",
-                                },
-                                "run_in_background": {
-                                    "type": "boolean",
-                                    "description": (
-                                        "Whether to return immediately with a durable subagent id."
-                                    ),
-                                },
-                            },
+                            "properties": properties,
                             "required": ["description", "prompt"],
                             "additionalProperties": False,
                         },
@@ -3650,6 +3694,71 @@ class HarnessService:
         await self.store.save(parent.session)
         self._publish_event(parent.session.id, started_event)
         return child_handle
+
+    async def _run_acp_subagent(
+        self,
+        parent: SessionHandle,
+        label: str,
+        prompt: str,
+        provider: str,
+        inherit_context: bool,
+    ) -> ToolResult:
+        """Delegate one task to the configured out-of-process ACP agent.
+
+        The child is a fresh remote session in its own process, so this provider
+        offers one-shot foreground runs only: background/continuable delegation
+        and context inheritance stay with the in-process provider.
+        """
+
+        config = self.acp_subagent
+        if config is None or provider != config.provider_name:
+            raise ValueError(
+                f"unknown subagent provider {provider!r}; this session has no such agent"
+            )
+        if inherit_context:
+            raise ValueError(
+                f"subagent provider {provider!r} inherits no parent context; "
+                "use subagent_fork for a seeded child"
+            )
+        try:
+            spec = config.spec_for(parent.session.header.cwd)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        self._publish_host(
+            {
+                "type": "host/subagent-started",
+                "sessionId": parent.session.id,
+                "provider": provider,
+                "label": label,
+            }
+        )
+        run = await start_acp_run([{"type": "text", "text": prompt}], spec=spec)
+        self._acp_runs[run.id] = run
+        self._acp_run_labels[run.id] = label
+        self._acp_run_parents[run.id] = parent.session.id
+        try:
+            result = await run.result()
+        finally:
+            await run.dispose()
+            self._acp_runs.pop(run.id, None)
+            self._acp_run_labels.pop(run.id, None)
+            self._acp_run_parents.pop(run.id, None)
+        output = result.output.strip()
+        meta: JsonObject = {
+            "kind": "foreground",
+            "provider": provider,
+            "subagentId": run.id,
+            "finishReason": result.stop_reason,
+        }
+        if result.stop_reason in {"completed", "max-tokens"}:
+            text = f"subagent {run.id} completed"
+            if output:
+                text += f":\n{output}"
+            return ToolResult(text, meta=meta)
+        text = f"subagent {run.id} ended with {result.stop_reason}"
+        if output:
+            text += f"\nPartial output:\n{output}"
+        return ToolResult(text, is_error=True, meta=meta)
 
     async def _run_foreground_subagent(
         self,
@@ -3886,6 +3995,23 @@ class HarnessService:
                     entries.append(entry)
                 if scope == "descendants":
                     pending.append((child.id, child_depth))
+        # Out-of-process ACP children own no session in this harness, so they
+        # are reported from the live-run registry instead of the session tree.
+        for run_id, run_parent in tuple(self._acp_run_parents.items()):
+            if run_parent != parent_session:
+                continue
+            entry = {
+                "kind": "child",
+                "id": run_id,
+                "label": self._acp_run_labels.get(run_id, run_id),
+                "status": "running" if run_id in self._acp_runs else "ready",
+                "mode": "one-shot",
+                "provider": self.acp_subagent.provider_name if self.acp_subagent else "acp",
+            }
+            if scope == "descendants":
+                entry["parent"] = run_parent
+                entry["depth"] = 1
+            entries.append(entry)
         return entries
 
     @staticmethod

@@ -96,7 +96,10 @@ The native Python host now contains:
 - a stdio JSON-RPC SDK server and `DeepSeekHarnessProcess` client for
   cross-language and multi-process embedding;
 - an automation-only ACP server over stdio with fresh text sessions,
-  committed assistant updates, one-shot permission decisions, and cancellation.
+  committed assistant updates, one-shot permission decisions, and cancellation;
+- an ACP client bridge that runs an external ACP agent as an out-of-process
+  subagent: credential-scrubbed spawn, committed-text collection, machine
+  permission policy, and an EOF → SIGTERM → SIGKILL disposal ladder.
 
 Install the development project with `uv`:
 
@@ -221,6 +224,18 @@ session that carry a tool call id become one-shot
 choices; any other answer, or an unanswered request, never grants access.
 Image, audio, embedded-resource, MCP, and additional-directory features are
 intentionally rejected or disabled.
+
+The same protocol can be driven in the other direction: `HarnessService`
+accepts an `AcpSubagentConfig` naming an external ACP agent, which then becomes
+a `subagent` tool provider (`agent="acp"`). Such a child is a fresh remote
+session, so it runs foreground-only: it inherits no conversation context,
+cannot be messaged afterwards, and is always reaped when the delegation ends
+or the service is disposed. Up to that boundary the provider behaves like the
+in-process one — streamed text becomes the tool result, a failed child returns
+an errored result with whatever partial output it produced, and both the child
+process's environment and its teardown follow the same rules as other harness
+spawns (ambient credential-shaped and `DSH_*` names are scrubbed, and disposal
+gives stdin EOF a real window before escalating to SIGTERM, then SIGKILL).
 
 Shell execution is disabled in `read-only` sessions. In `workspace-write`
 sessions, shell and persistent terminal tools are registered when the

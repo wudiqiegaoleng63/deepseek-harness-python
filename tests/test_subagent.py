@@ -94,9 +94,7 @@ def test_subagent_background_is_continuable_and_visible_to_control_tools(tmp_pat
         service = HarnessService(
             tmp_path / "sessions",
             cwd=tmp_path,
-            adapter_factory=lambda _model: cast(
-                LlmAdapter, RepeatingAdapter("background answer")
-            ),
+            adapter_factory=lambda _model: cast(LlmAdapter, RepeatingAdapter("background answer")),
         )
         await service.dispatch("session.create", {"sessionId": "parent", "cwd": str(tmp_path)})
         registry = service._tool_registries["parent"]
@@ -137,6 +135,136 @@ def test_subagent_background_is_continuable_and_visible_to_control_tools(tmp_pat
             == "Now provide a follow-up."
             for event in history["events"]
         )
+        await service.dispose()
+
+    asyncio.run(scenario())
+
+
+def acp_service(tmp_path, extra_env=None):
+    """A harness whose `subagent` tool can delegate to the fixture ACP child."""
+
+    import os
+    import sys
+    from pathlib import Path
+
+    from deepseek_harness.acp_client import AcpSubagentConfig
+
+    env = {name: value for name, value in os.environ.items() if name.startswith("MOCK_")}
+    env.update(extra_env or {})
+    return HarnessService(
+        tmp_path / "sessions",
+        cwd=tmp_path,
+        adapter_factory=lambda _model: cast(LlmAdapter, RepeatingAdapter()),
+        acp_subagent=AcpSubagentConfig(
+            command=sys.executable,
+            args=(str(Path(__file__).parent / "acp_child_fixture.py"),),
+            env=env,
+            dispose_eof_grace_ms=2_000,
+        ),
+    )
+
+
+def test_acp_subagent_delegates_foreground_through_the_tool(tmp_path) -> None:
+    async def scenario() -> None:
+        service = acp_service(tmp_path, {"MOCK_TEXT": "remote child answer"})
+        await service.dispatch("session.create", {"sessionId": "parent", "cwd": str(tmp_path)})
+        registry = service._tool_registries["parent"]
+        result = await registry.execute(
+            "subagent",
+            json.dumps(
+                {
+                    "description": "ask the remote agent",
+                    "prompt": "Answer directly.",
+                    "agent": "acp",
+                }
+            ),
+            ToolContext("parent", str(tmp_path)),
+        )
+        assert not result.is_error
+        assert "remote child answer" in result.text
+        assert result.meta is not None
+        assert result.meta["provider"] == "acp"
+        assert result.meta["finishReason"] == "completed"
+        assert result.meta["subagentId"]
+        # The out-of-process child owns no local session.
+        assert not list((tmp_path / "sessions").glob(f"**/{result.meta['subagentId']}*"))
+        await service.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_acp_subagent_rejects_unknown_provider_fork_and_background(tmp_path) -> None:
+    async def scenario() -> None:
+        service = acp_service(tmp_path)
+        await service.dispatch("session.create", {"sessionId": "parent", "cwd": str(tmp_path)})
+        registry = service._tool_registries["parent"]
+        context = ToolContext("parent", str(tmp_path))
+
+        unknown = await registry.execute(
+            "subagent",
+            json.dumps({"description": "x", "prompt": "y", "agent": "spawn"}),
+            context,
+        )
+        assert unknown.is_error
+        assert "unknown subagent provider" in unknown.text
+
+        forked = await registry.execute(
+            "subagent_fork",
+            json.dumps({"description": "x", "prompt": "y", "agent": "acp"}),
+            context,
+        )
+        assert forked.is_error
+        assert "inherits no parent context" in forked.text
+
+        # The out-of-process provider is one-shot: a background call names a
+        # fresh remote session that no follow-up tool could address, so it is
+        # rejected rather than silently downgraded.
+        background = await registry.execute(
+            "subagent",
+            json.dumps(
+                {"description": "x", "prompt": "y", "agent": "acp", "run_in_background": True}
+            ),
+            context,
+        )
+        assert background.is_error
+        assert "foreground" in background.text
+        await service.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_acp_subagent_maps_a_failed_child_to_an_error_result(tmp_path) -> None:
+    async def scenario() -> None:
+        service = acp_service(tmp_path, {"MOCK_STOP": "max_turn_requests", "MOCK_TEXT": "partial"})
+        await service.dispatch("session.create", {"sessionId": "parent", "cwd": str(tmp_path)})
+        registry = service._tool_registries["parent"]
+        result = await registry.execute(
+            "subagent",
+            json.dumps({"description": "x", "prompt": "y", "agent": "acp"}),
+            ToolContext("parent", str(tmp_path)),
+        )
+        assert result.is_error
+        assert result.meta is not None
+        assert result.meta["finishReason"] == "error"
+        assert "partial" in result.text
+        await service.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_acp_subagent_tool_is_hidden_without_configuration(tmp_path) -> None:
+    async def scenario() -> None:
+        service = HarnessService(
+            tmp_path / "sessions",
+            cwd=tmp_path,
+            adapter_factory=lambda _model: cast(LlmAdapter, RepeatingAdapter()),
+        )
+        await service.dispatch("session.create", {"sessionId": "parent", "cwd": str(tmp_path)})
+        registry = service._tool_registries["parent"]
+        schema = next(item for item in registry.schemas() if item.name == "subagent")
+        properties = schema.parameters["properties"]
+        assert isinstance(properties, dict)
+        assert "agent" not in properties
         await service.dispose()
 
     asyncio.run(scenario())
