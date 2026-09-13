@@ -97,9 +97,12 @@ The native Python host now contains:
   cross-language and multi-process embedding;
 - an automation-only ACP server over stdio with fresh text sessions,
   committed assistant updates, one-shot permission decisions, and cancellation;
-- an ACP client bridge that runs an external ACP agent as an out-of-process
-  subagent: credential-scrubbed spawn, committed-text collection, machine
-  permission policy, and an EOF → SIGTERM → SIGKILL disposal ladder.
+- two out-of-process subagent providers beside the in-process one: an ACP
+  client bridge that drives any Agent Client Protocol agent, and an SDK bridge
+  that drives a peer harness runtime over stdio JSON-RPC. Both spawn from a
+  credential-scrubbed environment, collect the child's answer, expose a
+  machine permission policy where the wire has one, and tear down through an
+  EOF → SIGTERM → SIGKILL ladder.
 
 Install the development project with `uv`:
 
@@ -226,8 +229,9 @@ Image, audio, embedded-resource, MCP, and additional-directory features are
 intentionally rejected or disabled.
 
 The same protocol can be driven in the other direction: `HarnessService`
-accepts an `AcpSubagentConfig` naming an external ACP agent, which then becomes
-a `subagent` tool provider (`agent="acp"`). Such a child is a fresh remote
+accepts an `AcpSubagentConfig` naming an external ACP agent, or an
+`SdkSubagentConfig` naming a peer harness runtime (`dsh-python sdk-server`),
+and each becomes a `subagent` tool provider (`agent="acp"` / `agent="dsh-sdk"`). Such a child is a fresh remote
 session, so it runs foreground-only: it inherits no conversation context,
 cannot be messaged afterwards, and is always reaped when the delegation ends
 or the service is disposed. Up to that boundary the provider behaves like the

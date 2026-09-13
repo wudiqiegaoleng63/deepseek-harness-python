@@ -268,3 +268,114 @@ def test_acp_subagent_tool_is_hidden_without_configuration(tmp_path) -> None:
         await service.dispose()
 
     asyncio.run(scenario())
+
+
+def sdk_service(tmp_path, extra_env=None):
+    """A harness whose `subagent` tool can delegate to the fixture SDK runtime."""
+
+    import os
+    import sys
+    from pathlib import Path
+
+    from deepseek_harness.sdk_client import SdkSubagentConfig
+
+    env = {name: value for name, value in os.environ.items() if name.startswith("MOCK_")}
+    env.update(extra_env or {})
+    return HarnessService(
+        tmp_path / "sessions",
+        cwd=tmp_path,
+        adapter_factory=lambda _model: cast(LlmAdapter, RepeatingAdapter()),
+        sdk_subagent=SdkSubagentConfig(
+            command=sys.executable,
+            args=(str(Path(__file__).parent / "sdk_child_fixture.py"),),
+            env=env,
+            shutdown_timeout_ms=1_000,
+            dispose_eof_grace_ms=2_000,
+        ),
+    )
+
+
+def test_sdk_subagent_delegates_foreground_through_the_tool(tmp_path) -> None:
+    async def scenario() -> None:
+        service = sdk_service(tmp_path, {"MOCK_SDK_TEXT": "peer harness answer"})
+        await service.dispatch("session.create", {"sessionId": "parent", "cwd": str(tmp_path)})
+        registry = service._tool_registries["parent"]
+        result = await registry.execute(
+            "subagent",
+            json.dumps(
+                {
+                    "description": "ask the peer harness",
+                    "prompt": "Answer directly.",
+                    "agent": "dsh-sdk",
+                }
+            ),
+            ToolContext("parent", str(tmp_path)),
+        )
+        assert not result.is_error
+        assert "peer harness answer" in result.text
+        assert result.meta is not None
+        assert result.meta["provider"] == "dsh-sdk"
+        assert result.meta["finishReason"] == "completed"
+        await service.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_sdk_subagent_maps_an_unclean_child_turn_to_an_error(tmp_path) -> None:
+    async def scenario() -> None:
+        service = sdk_service(tmp_path, {"MOCK_SDK_TURN_KIND": "error", "MOCK_SDK_TEXT": "partial"})
+        await service.dispatch("session.create", {"sessionId": "parent", "cwd": str(tmp_path)})
+        registry = service._tool_registries["parent"]
+        result = await registry.execute(
+            "subagent",
+            json.dumps({"description": "x", "prompt": "y", "agent": "dsh-sdk"}),
+            ToolContext("parent", str(tmp_path)),
+        )
+        assert result.is_error
+        assert result.meta is not None
+        assert result.meta["finishReason"] == "error"
+        assert "partial" in result.text
+        await service.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_both_remote_providers_are_offered_by_name(tmp_path) -> None:
+    async def scenario() -> None:
+        import os
+        import sys
+        from pathlib import Path
+
+        from deepseek_harness.acp_client import AcpSubagentConfig
+        from deepseek_harness.sdk_client import SdkSubagentConfig
+
+        fixtures = Path(__file__).parent
+        env = {name: value for name, value in os.environ.items() if name.startswith("MOCK_")}
+        service = HarnessService(
+            tmp_path / "sessions",
+            cwd=tmp_path,
+            adapter_factory=lambda _model: cast(LlmAdapter, RepeatingAdapter()),
+            acp_subagent=AcpSubagentConfig(
+                command=sys.executable,
+                args=(str(fixtures / "acp_child_fixture.py"),),
+                env=env,
+                dispose_eof_grace_ms=2_000,
+            ),
+            sdk_subagent=SdkSubagentConfig(
+                command=sys.executable,
+                args=(str(fixtures / "sdk_child_fixture.py"),),
+                env=env,
+                dispose_eof_grace_ms=2_000,
+            ),
+        )
+        await service.dispatch("session.create", {"sessionId": "parent", "cwd": str(tmp_path)})
+        registry = service._tool_registries["parent"]
+        schema = next(item for item in registry.schemas() if item.name == "subagent")
+        properties = schema.parameters["properties"]
+        assert isinstance(properties, dict)
+        agent_schema = properties["agent"]
+        assert isinstance(agent_schema, dict)
+        assert agent_schema["enum"] == ["acp", "dsh-sdk"]
+        await service.dispose()
+
+    asyncio.run(scenario())
